@@ -1,0 +1,68 @@
+# ============================================================
+# Pipeline 16: Bash Advanced – Scripting Best Practices
+# Complexity: Simple
+# Concepts: bash task, set -euo pipefail, heredoc, multiline,
+#           exit codes, piping, env var mapping, workingDirectory
+# ============================================================
+
+trigger:
+  - main
+
+pool:
+  vmImage: ubuntu-latest
+
+steps:
+  - checkout: self
+
+  # Bash with strict mode
+  - bash: |
+      set -euo pipefail
+      echo "Strict-mode bash step"
+      echo "Branch : $BUILD_BRANCH"
+      echo "Commit : $BUILD_COMMIT"
+    displayName: Strict-mode bash
+    env:
+      BUILD_BRANCH: $(Build.SourceBranchName)
+      BUILD_COMMIT: $(Build.SourceVersion)
+
+  # Heredoc usage
+  - bash: |
+      cat <<'EOF'
+      This is a heredoc block.
+      It supports multi-line strings without escape characters.
+      Build: $(Build.BuildId)
+      EOF
+    displayName: Heredoc demo
+
+  # Multiline command with line continuation
+  - bash: |
+      echo "Installing tools..." \
+        && apt-get update -qq \
+        && echo "Update done"
+    displayName: Chained commands
+
+  # Working directory override
+  - bash: |
+      pwd
+      ls -la
+    displayName: List temp dir
+    workingDirectory: /tmp
+
+  # Exit code handling – continueOnError
+  - bash: |
+      echo "This command will fail"
+      exit 1
+    displayName: Intentional failure (continued)
+    continueOnError: true
+
+  - bash: echo "Pipeline still running despite previous failure"
+    displayName: Step after continued failure
+
+  # Write and read a temp file
+  - bash: |
+      TMPFILE=$(mktemp)
+      echo "build=$(Build.BuildId)" > "$TMPFILE"
+      echo "Written to: $TMPFILE"
+      cat "$TMPFILE"
+      rm "$TMPFILE"
+    displayName: Temp file usage

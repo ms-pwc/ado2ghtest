@@ -1,0 +1,132 @@
+# ============================================================
+# Pipeline 69: Custom Task Wrapper via Node.js Inline Script
+# Complexity: Complex
+# Concepts: NodeJS inline task (task: NodeScript), custom ADO
+#           logging commands from Node.js, dynamic step generation
+#           using JavaScript, pipeline SDK patterns
+# ============================================================
+
+trigger:
+  - main
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  targetEnvironment: staging
+
+steps:
+  - checkout: self
+
+  - task: NodeTool@0
+    displayName: Install Node.js 20
+    inputs:
+      versionSpec: '20.x'
+
+  # Custom Node.js task using inline script
+  - task: CmdLine@2
+    displayName: Run custom Node.js task logic
+    inputs:
+      script: |
+        node -e "
+        const fs   = require('fs');
+        const path = require('path');
+
+        // ADO logging command helper
+        function setVariable(name, value, isSecret = false, isOutput = false) {
+          const opts = [
+            isSecret ? 'issecret=true' : '',
+            isOutput ? 'isOutput=true' : ''
+          ].filter(Boolean).join(';');
+          console.log(\`##vso[task.setvariable variable=\${name}\${opts ? ';' + opts : ''}]\${value}\`);
+        }
+
+        function setTaskStatus(state, message) {
+          // states: Succeeded, SucceededWithIssues, Failed
+          console.log(\`##vso[task.complete result=\${state}]\${message}\`);
+        }
+
+        function logSection(title) {
+          console.log(\`##[section]${title}\`);
+        }
+
+        function logGroup(name) {
+          console.log(\`##[group]\${name}\`);
+        }
+
+        function endGroup() {
+          console.log('##[endgroup]');
+        }
+
+        function logWarning(msg) {
+          console.log(\`##vso[task.logissue type=warning]\${msg}\`);
+        }
+
+        function logError(msg) {
+          console.log(\`##vso[task.logissue type=error]\${msg}\`);
+        }
+
+        function addBuildTag(tag) {
+          console.log(\`##vso[build.addbuildtag]\${tag}\`);
+        }
+
+        function uploadArtifact(name, filePath) {
+          console.log(\`##vso[artifact.upload containerfolder=\${name};artifactname=\${name}]\${filePath}\`);
+        }
+
+        // ── Custom logic ─────────────────────────────────────────
+        logSection('Configuration Analysis');
+
+        const env = process.env.ENVIRONMENT || 'staging';
+        const buildId = process.env.BUILD_BUILDID || '0';
+
+        logGroup('Environment Detection');
+        console.log('Environment  :', env);
+        console.log('Build ID     :', buildId);
+        endGroup();
+
+        // Compute dynamic values
+        const version = \`1.0.\${buildId}\`;
+        const deployTimestamp = new Date().toISOString();
+
+        setVariable('computedVersion', version, false, true);
+        setVariable('deployTimestamp', deployTimestamp, false, true);
+
+        // Write a JSON config file
+        const config = {
+          version,
+          environment: env,
+          buildId,
+          deployTimestamp,
+          featureFlags: {
+            newUi: env !== 'dev',
+            betaFeature: false
+          }
+        };
+
+        const outDir = process.env.BUILD_ARTIFACTSTAGINGDIRECTORY || '/tmp';
+        const configPath = path.join(outDir, 'deploy-config.json');
+        fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+        console.log('Config written to:', configPath);
+        console.log(JSON.stringify(config, null, 2));
+
+        // Add build tags
+        addBuildTag(\`version:\${version}\`);
+        addBuildTag(\`environment:\${env}\`);
+
+        // Simulate a validation check
+        if (env === 'production' && !process.env.APPROVED) {
+          logWarning('Deploying to production without explicit approval flag');
+        }
+
+        console.log('Custom Node.js task completed successfully');
+        "
+    env:
+      ENVIRONMENT: $(targetEnvironment)
+      APPROVED: $(DEPLOYMENT_APPROVED)
+
+  # Use the variable set by Node.js task
+  - bash: |
+      echo "Computed version : $(computedVersion)"
+      echo "Deploy timestamp : $(deployTimestamp)"
+    displayName: Use output from Node.js task

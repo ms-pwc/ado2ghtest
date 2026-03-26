@@ -1,0 +1,80 @@
+# ============================================================
+# Pipeline 23: Java Maven – Build, Test, Package
+# Complexity: Simple-Medium
+# Concepts: JavaToolInstaller, Maven task, Surefire reports,
+#           JaCoCo coverage, WAR/JAR artifact, Maven cache
+# ============================================================
+
+trigger:
+  branches:
+    include: [main, develop]
+  paths:
+    include: ['**/*.java', pom.xml, '**/pom.xml']
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  MAVEN_OPTS: '-Xmx3072m'
+  mavenGoals: 'clean verify'
+
+steps:
+  - checkout: self
+
+  # Install specific JDK version
+  - task: JavaToolInstaller@0
+    displayName: Use Java 17 (Temurin)
+    inputs:
+      versionSpec: '17'
+      jdkArchitectureOption: x64
+      jdkSourceOption: PreInstalled
+
+  - script: |
+      java -version
+      mvn --version
+    displayName: Verify Java & Maven
+
+  # Cache Maven local repository
+  - task: Cache@2
+    displayName: Cache Maven local repo
+    inputs:
+      key: 'maven | "$(Agent.OS)" | **/pom.xml'
+      restoreKeys: maven | "$(Agent.OS)"
+      path: $(HOME)/.m2/repository
+
+  # Maven build with Surefire & JaCoCo
+  - task: Maven@4
+    displayName: Maven build & test
+    inputs:
+      mavenPomFile: pom.xml
+      goals: $(mavenGoals)
+      options: >
+        -B
+        -Dmaven.test.failure.ignore=true
+        -Dsurefire.reportFormat=plain
+      publishJUnitResults: true
+      testResultsFiles: '**/surefire-reports/TEST-*.xml'
+      codeCoverageToolOption: JaCoCo
+      codeCoverageClassFilter: |
+        +:com.myapp.*
+        -:com.myapp.generated.*
+      javaHomeOption: JDKVersion
+      jdkVersionOption: '1.17'
+      mavenVersionOption: Default
+      checkStyleRunAnalysis: true
+      pmdRunAnalysis: true
+      findBugsRunAnalysis: false
+
+  # Publish the JAR/WAR
+  - task: CopyFiles@2
+    displayName: Stage artifact
+    inputs:
+      SourceFolder: target
+      Contents: '*.jar'
+      TargetFolder: $(Build.ArtifactStagingDirectory)
+
+  - task: PublishPipelineArtifact@1
+    displayName: Publish jar
+    inputs:
+      targetPath: $(Build.ArtifactStagingDirectory)
+      artifact: java-artifact

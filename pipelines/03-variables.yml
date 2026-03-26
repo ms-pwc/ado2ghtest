@@ -1,0 +1,100 @@
+# ============================================================
+# Pipeline 03: Variables深 – All Variable Mechanisms
+# Concepts: inline vars, variable groups, variable templates,
+#           secret variables, output variables, env vars,
+#           compile-time vs runtime expressions
+# ============================================================
+
+trigger:
+  branches:
+    include:
+      - main
+      - feature/*
+
+# ── Variable group (defined in ADO Library) ─────────────────
+# The group "myapp-config" holds shared secrets/values
+variables:
+  - group: myapp-config             # variable group from ADO Library
+
+  # ── Pipeline-level inline variables ─────────────────────────
+  - name: buildConfiguration
+    value: Release
+
+  - name: appName
+    value: my-dotnet-app
+
+  # ── Conditionally set a variable at compile time ─────────────
+  # ${{ }} = compile-time (template expression)
+  - name: environment
+    ${{ if eq(variables['Build.SourceBranchName'], 'main') }}:
+      value: production
+    ${{ else }}:
+      value: staging
+
+pool:
+  vmImage: ubuntu-latest
+
+jobs:
+  - job: DemoVariables
+    displayName: Variable Mechanics Demo
+
+    # ── Job-level variable (overrides pipeline-level) ────────
+    variables:
+      jobVar: "I am a job-scoped variable"
+      # Reference another variable in its definition
+      artifactDir: $(Build.ArtifactStagingDirectory)/$(appName)
+
+    steps:
+      # ── Print predefined system variables ───────────────────
+      - script: |
+          echo "Pipeline variables:"
+          echo "  Build.BuildId       = $(Build.BuildId)"
+          echo "  Build.BuildNumber   = $(Build.BuildNumber)"
+          echo "  Build.SourceBranch  = $(Build.SourceBranch)"
+          echo "  System.TeamProject  = $(System.TeamProject)"
+          echo "  Agent.OS            = $(Agent.OS)"
+          echo ""
+          echo "Custom variables:"
+          echo "  appName             = $(appName)"
+          echo "  buildConfiguration  = $(buildConfiguration)"
+          echo "  environment         = $(environment)"
+          echo "  jobVar              = $(jobVar)"
+        displayName: Print variables
+
+      # ── Set a runtime output variable ───────────────────────
+      - bash: |
+          VERSION="1.0.$(Build.BuildId)"
+          echo "##vso[task.setvariable variable=appVersion;isOutput=true]$VERSION"
+          echo "Set appVersion = $VERSION"
+        name: versioning
+        displayName: Compute and set appVersion
+
+      # ── Read the output variable in a later step ────────────
+      - bash: echo "App version is $(versioning.appVersion)"
+        displayName: Use output variable
+
+      # ── Override a variable mid-pipeline (logging command) ──
+      - bash: echo "##vso[task.setvariable variable=buildConfiguration]Debug"
+        displayName: Override buildConfiguration to Debug
+
+      - bash: echo "buildConfiguration is now $(buildConfiguration)"
+        displayName: Confirm override
+
+      # ── Expose secret variable via env mapping ───────────────
+      # Secrets are never passed as plain env vars automatically;
+      # they must be mapped explicitly.
+      - script: echo "Secret length = ${#MY_SECRET}"
+        displayName: Use secret variable safely
+        env:
+          MY_SECRET: $(mySecretFromGroup)    # mapped from variable group
+
+      # ── Compile-time conditional on a variable ───────────────
+      - ${{ if eq(variables['buildConfiguration'], 'Release') }}:
+        - script: echo "This step only appears in Release config"
+          displayName: Release-only step
+
+      # ── Counter variable (auto-increment per pipeline run) ───
+      - bash: |
+          echo "##vso[task.setvariable variable=patchVersion]$(counter variables['appName'], 0)"
+          echo "Patch counter value: $(patchVersion)"
+        displayName: Counter variable (patch number)

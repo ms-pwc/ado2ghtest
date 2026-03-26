@@ -1,0 +1,109 @@
+# ============================================================
+# Pipeline 53: GitOps-Style CD with ArgoCD
+# Complexity: Complex
+# Concepts: GitOps CD pattern, image promotion via git commit,
+#           ArgoCD app sync via REST, health polling,
+#           environment-branch mapping
+# ============================================================
+
+trigger: none    # triggered by CI pipeline via pipeline resource
+
+resources:
+  pipelines:
+    - pipeline: ciPipeline
+      source: MyApp-CI
+      trigger:
+        branches:
+          include: [main]
+
+variables:
+  gitOpsRepo: https://dev.azure.com/myorg/myproject/_git/gitops-configs
+  argocdServer: argocd.mycompany.com
+  imageRepo: myacr.azurecr.io/myapp/api
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: UpdateGitOps
+    displayName: Update GitOps Config
+    jobs:
+      - job: PatchImageTag
+        steps:
+          # Clone the GitOps config repository
+          - bash: |
+              git config --global user.email "pipeline@devops.local"
+              git config --global user.name  "Azure Pipelines"
+              git clone $(gitOpsRepo) gitops-configs
+            displayName: Clone GitOps repo
+
+          # Update image tag in kustomization / values file
+          - bash: |
+              cd gitops-configs
+              IMAGE_NEW="$(imageRepo):$(resources.pipeline.ciPipeline.runID)"
+              
+              # Update kustomize image tag
+              sed -i "s|$(imageRepo):.*|$IMAGE_NEW|g" \
+                overlays/production/kustomization.yaml
+              
+              echo "Updated image to: $IMAGE_NEW"
+              git diff
+            displayName: Patch image tag
+
+          # Commit and push the change
+          - bash: |
+              cd gitops-configs
+              git add -A
+              git commit -m \
+                "chore: promote $(resources.pipeline.ciPipeline.sourceBranch) build $(resources.pipeline.ciPipeline.runID) to production [skip ci]"
+              
+              # Push with PAT stored in variable
+              git push "https://$(GITOPS_PAT)@dev.azure.com/myorg/myproject/_git/gitops-configs"
+            displayName: Push GitOps config update
+            env:
+              GITOPS_PAT: $(GITOPS_PAT)
+
+  - stage: SyncArgoCD
+    displayName: Sync ArgoCD Application
+    dependsOn: UpdateGitOps
+    jobs:
+      - job: ArgoSync
+        steps:
+          # Install ArgoCD CLI
+          - bash: |
+              VERSION=v2.10.0
+              curl -sSL -o /usr/local/bin/argocd \
+                "https://github.com/argoproj/argo-cd/releases/download/${VERSION}/argocd-linux-amd64"
+              chmod +x /usr/local/bin/argocd
+              argocd version --client
+            displayName: Install ArgoCD CLI
+
+          # Login to ArgoCD
+          - bash: |
+              argocd login $(argocdServer) \
+                --username admin \
+                --password $(ARGOCD_PASSWORD) \
+                --insecure \
+                --grpc-web
+            displayName: Login to ArgoCD
+            env:
+              ARGOCD_PASSWORD: $(ARGOCD_PASSWORD)
+
+          # Sync the application
+          - bash: |
+              argocd app sync myapp-production \
+                --prune \
+                --timeout 300
+            displayName: ArgoCD app sync
+
+          # Wait for healthy status
+          - bash: |
+              argocd app wait myapp-production \
+                --health \
+                --timeout 300
+            displayName: Wait for healthy state
+
+          # Print application status
+          - bash: argocd app get myapp-production
+            displayName: Print app status

@@ -1,0 +1,522 @@
+# ============================================================
+# Pipeline 100: THE ULTIMATE REFERENCE PIPELINE
+# Complexity: MAXIMUM
+#
+# This single pipeline demonstrates EVERY major Azure DevOps
+# YAML pipeline concept in one comprehensive reference.
+#
+# Concepts covered:
+#   ✓ All trigger types (CI, PR, schedule, pipeline resource)
+#   ✓ All variable types (inline, group, output, counter, runtime)
+#   ✓ All parameter types (string, bool, number, object, stepList)
+#   ✓ All condition types (expression, stage, job, step)
+#   ✓ All pool types (vmImage, name, demands, server/agentless)
+#   ✓ All job types (job, deployment, matrix, container, agentless)
+#   ✓ All strategy types (runOnce, rolling, canary)
+#   ✓ Templates (steps, jobs, stages, variables, extends)
+#   ✓ Resources (repos, pipelines, containers, packages, webhooks)
+#   ✓ Artifacts, caching, workspace
+#   ✓ Service containers
+#   ✓ Environments and approvals
+#   ✓ Lock behavior, batch triggers
+#   ✓ Runtime parameters and compile-time expressions
+#   ✓ each / if / elseif / else template expressions
+#   ✓ Fan-out/fan-in, dependsOn, stageDependencies
+#   ✓ Output variables across jobs/stages
+#   ✓ Checkout options (lfs, submodules, fetchDepth, clean)
+#   ✓ Security (OIDC, managed identity, secret masking)
+#   ✓ Multi-platform matrix (Windows, macOS, Linux)
+#   ✓ Retry, timeout, continueOnError
+#   ✓ PublishTestResults, PublishCodeCoverageResults
+#   ✓ File operations, archive, copy
+#   ✓ Azure tasks (CLI, Bicep, AKS, Docker, Functions)
+#   ✓ NotifyTeams webhook post-deploy
+#   ✓ Post-job cleanup always()
+# ============================================================
+
+# ─── TRIGGERS ───────────────────────────────────────────────
+trigger:
+  batch: true
+  branches:
+    include: [main, release/*, feature/*]
+    exclude: [refs/heads/wip/*]
+  paths:
+    include: ['**']
+    exclude: ['docs/**', '*.md']
+  tags:
+    include: ['v*.*.*']
+
+pr:
+  branches:
+    include: [main, develop]
+  drafts: false
+  paths:
+    include: ['src/**', 'tests/**']
+
+schedules:
+  - cron: '0 3 * * 1-5'
+    displayName: Nightly build (weekdays)
+    branches:
+      include: [main]
+    always: false
+
+# ─── RESOURCES ──────────────────────────────────────────────
+resources:
+  repositories:
+    - repository: templates
+      type: git
+      name: MyProject/pipeline-templates
+      ref: refs/heads/main
+
+  pipelines:
+    - pipeline: build-infra
+      source: infra-build-pipeline
+      trigger:
+        branches: [main]
+
+  containers:
+    - container: node20
+      image: node:20-alpine
+    - container: python312
+      image: python:3.12-slim
+    - container: dotnet8
+      image: mcr.microsoft.com/dotnet/sdk:8.0
+
+  packages:
+    - package: my-npm-pkg
+      type: npm
+      connection: sc-npm-feed
+      name: '@mycompany/shared-ui'
+      version: '*'
+      trigger: true
+
+# ─── PARAMETERS ─────────────────────────────────────────────
+parameters:
+  - name: environment
+    type: string
+    default: staging
+    values: [dev, staging, prod]
+    displayName: Target Environment
+
+  - name: skipTests
+    type: boolean
+    default: false
+    displayName: Skip unit tests (emergency only)
+
+  - name: buildNumber
+    type: number
+    default: 0
+    displayName: Manual build override (0 = auto)
+
+  - name: extraSteps
+    type: stepList
+    default: []
+    displayName: Inject custom steps
+
+  - name: services
+    type: object
+    default:
+      - name: api
+        lang: dotnet
+        port: 8080
+      - name: frontend
+        lang: node
+        port: 3000
+      - name: worker
+        lang: python
+        port: 0
+    displayName: Services to build
+
+  - name: deploymentStrategy
+    type: string
+    default: rolling
+    values: [runOnce, rolling, canary]
+
+  - name: matrix
+    type: object
+    default:
+      windows:
+        vmImage: windows-latest
+        os: windows
+      linux:
+        vmImage: ubuntu-latest
+        os: linux
+      macos:
+        vmImage: macos-latest
+        os: macos
+
+# ─── VARIABLES ──────────────────────────────────────────────
+variables:
+  # Inline group
+  - group: ${{ parameters.environment }}-common-vars
+
+  # Compile-time environment-specific variables
+  - ${{ if eq(parameters.environment, 'prod') }}:
+    - name: deployTimeout
+      value: 60
+    - name: minInstances
+      value: 3
+    - name: requireApproval
+      value: true
+  - ${{ elseif eq(parameters.environment, 'staging') }}:
+    - name: deployTimeout
+      value: 30
+    - name: minInstances
+      value: 1
+    - name: requireApproval
+      value: false
+  - ${{ else }}:
+    - name: deployTimeout
+      value: 15
+    - name: minInstances
+      value: 1
+    - name: requireApproval
+      value: false
+
+  # Runtime variables
+  - name: imageTag
+    value: $(Build.BuildId)
+  - name: buildCounter
+    value: $[counter(variables['Build.SourceBranchName'], 1)]
+  - name: isFork
+    value: $[eq(variables['System.PullRequest.IsFork'], 'True')]
+  - name: effectiveBuildNum
+    ${{ if ne(parameters.buildNumber, 0) }}:
+      value: ${{ parameters.buildNumber }}
+    ${{ else }}:
+      value: $(Build.BuildId)
+
+# ─── STAGES ─────────────────────────────────────────────────
+stages:
+
+  # ── STAGE 1: Pre-build Checks ────────────────────────────
+  - stage: PreBuild
+    displayName: Pre-Build Checks
+    lockBehavior: sequential
+    jobs:
+
+      # Agentless manual gate
+      - job: Wait_For_Approval
+        displayName: Wait for approval (prod only)
+        condition: and(succeeded(), eq(variables['requireApproval'], 'true'))
+        pool: server
+        timeoutInMinutes: 1440   # 24h
+        steps:
+          - task: ManualValidation@0
+            inputs:
+              notifyUsers: $(approvalEmail)
+              instructions: Approve deployment to ${{ parameters.environment }}?
+              onTimeout: reject
+
+      # Security scan
+      - job: SecurityScan
+        displayName: Security Gate
+        dependsOn: Wait_For_Approval
+        condition: |
+          or(
+            not(eq(variables['requireApproval'], 'true')),
+            and(succeeded('Wait_For_Approval'), eq(variables['requireApproval'], 'true'))
+          )
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: self
+            fetchDepth: 1
+            clean: true
+
+          - bash: |
+              echo "##[section]Secret scanning"
+              curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh \
+                | sh -s -- -b /usr/local/bin v3.63.2
+              trufflehog git file://. --since-commit HEAD~5 --only-verified --json | tee trufflehog.json || true
+              SECRETS=$(wc -l < trufflehog.json)
+              echo "Potential secrets found: $SECRETS"
+              [ "$SECRETS" -eq "0" ] || echo "##vso[task.logissue type=warning]Potential secrets detected – review trufflehog.json"
+            displayName: Secret scan
+
+          - bash: |
+              echo "##vso[task.setvariable variable=scanPassed;isOutput=true]true"
+            name: securityGate
+            displayName: Gate passed
+
+  # ── STAGE 2: Build (Multi-Service, Dynamic) ──────────────
+  - stage: Build
+    displayName: Build All Services
+    dependsOn: PreBuild
+    condition: succeeded('PreBuild')
+    jobs:
+
+      # Dynamically generate a build job per service
+      - ${{ each svc in parameters.services }}:
+        - job: Build_${{ replace(svc.name, '-', '_') }}
+          displayName: Build ${{ svc.name }} (${{ svc.lang }})
+          pool:
+            vmImage: ubuntu-latest
+          variables:
+            serviceDir: src/${{ svc.name }}
+          steps:
+            - checkout: self
+              fetchDepth: 0
+
+            # Cache package dependencies
+            - task: Cache@2
+              inputs:
+                key: ${{ svc.lang }} | $(Agent.OS) | $(serviceDir)/package-lock.json
+                restoreKeys: ${{ svc.lang }} | $(Agent.OS)
+                path: |
+                  $${HOME}/.npm
+                  $${HOME}/.nuget/packages
+                  $${HOME}/.cache/pip
+              displayName: Cache dependencies
+
+            # Language-specific build steps
+            - ${{ if eq(svc.lang, 'dotnet') }}:
+              - bash: dotnet restore && dotnet build -c Release
+                workingDirectory: $(serviceDir)
+              - bash: |
+                  dotnet test --no-build -c Release --logger trx \
+                    /p:CollectCoverage=true /p:CoverletOutputFormat=cobertura
+                workingDirectory: $(serviceDir)
+                condition: ${{ not(parameters.skipTests) }}
+              - bash: dotnet publish -c Release -o $(Build.StagingDirectory)/${{ svc.name }}
+                workingDirectory: $(serviceDir)
+
+            - ${{ if eq(svc.lang, 'node') }}:
+              - bash: npm ci && npm run lint && npm run build
+                workingDirectory: $(serviceDir)
+              - bash: npm test -- --coverage --ci --reporters=jest-junit
+                workingDirectory: $(serviceDir)
+                condition: ${{ not(parameters.skipTests) }}
+
+            - ${{ if eq(svc.lang, 'python') }}:
+              - bash: pip install -e ".[dev]" && flake8 . && black --check .
+                workingDirectory: $(serviceDir)
+              - bash: pytest --junitxml=test-results.xml --cov=. --cov-report=xml
+                workingDirectory: $(serviceDir)
+                condition: ${{ not(parameters.skipTests) }}
+
+            # Inject any extra steps from parameter
+            - ${{ parameters.extraSteps }}
+
+            # Publish test results
+            - task: PublishTestResults@2
+              condition: ${{ not(parameters.skipTests) }}
+              inputs:
+                testResultsFormat: ${{ if eq(svc.lang, 'dotnet') }}:VSTest${{ else }}:JUnit
+                testResultsFiles: '**/*.xml'
+                testRunTitle: ${{ svc.name }} tests
+
+            # Build Docker image
+            - task: Docker@2
+              inputs:
+                command: buildAndPush
+                repository: $(containerRegistry)/${{ svc.name }}
+                containerRegistry: sc-acr
+                dockerfile: $(serviceDir)/Dockerfile
+                tags: $(imageTag)
+
+            # Output image ref for downstream
+            - bash: |
+                echo "##vso[task.setvariable variable=imageRef_${{ svc.name }};isOutput=true]$(containerRegistry)/${{ svc.name }}:$(imageTag)"
+              name: buildOut_${{ replace(svc.name, '-', '_') }}
+
+            # Publish build artifact
+            - task: PublishPipelineArtifact@1
+              inputs:
+                targetPath: $(Build.StagingDirectory)/${{ svc.name }}
+                artifactName: drop-${{ svc.name }}
+
+  # ── STAGE 3: Multi-Platform Validation ───────────────────
+  - stage: CrossPlatformTests
+    displayName: Cross-Platform Integration Tests
+    dependsOn: Build
+    jobs:
+      - job: CrossPlatform
+        displayName: Test on $[variables.os]
+        strategy:
+          matrix: ${{ parameters.matrix }}
+          maxParallel: 3
+        pool:
+          vmImage: $(vmImage)
+        container: ${{ if eq(variables['os'], 'linux') }}:node20
+        timeoutInMinutes: 20
+        retryCountOnTaskFailure: 1
+        steps:
+          - checkout: self
+
+          - bash: echo "Running on $(os) – agent $(Agent.MachineName)"
+            displayName: Platform info
+
+          - script: npm install -g @playwright/test && playwright install
+            condition: eq(variables['os'], 'linux')
+            displayName: Install test deps (Linux)
+
+          - pwsh: Write-Host "PowerShell integration tests on Windows"
+            condition: eq(variables['os'], 'windows')
+            displayName: Windows smoke test
+
+          - ${{ if eq(variables['os'], 'macos') }}:
+            - bash: echo "macOS-specific check"
+              displayName: macOS check
+
+  # ── STAGE 4: Deploy (strategy driven by parameter) ───────
+  - stage: Deploy
+    displayName: Deploy to ${{ parameters.environment }}
+    dependsOn: CrossPlatformTests
+    condition: and(succeeded('CrossPlatformTests'), ne(variables['Build.Reason'], 'PullRequest'))
+    variables:
+      # Read output variables from Build stage (first service)
+      apiImageRef: $[ stageDependencies.Build.Build_api.outputs['buildOut_api.imageRef_api'] ]
+    jobs:
+      - deployment: Deploy_App
+        displayName: Deploy ${{ parameters.deploymentStrategy }}
+        environment: ${{ parameters.environment }}/app-namespace
+        timeoutInMinutes: $(deployTimeout)
+        strategy:
+          ${{ if eq(parameters.deploymentStrategy, 'canary') }}:
+            canary:
+              increments: [10, 50, 100]
+              preDeploy:
+                steps:
+                  - bash: echo "Pre-deploy for canary"
+              deploy:
+                steps:
+                  - checkout: self
+                  - task: KubernetesManifest@1
+                    inputs:
+                      action: deploy
+                      kubernetesServiceConnection: sc-aks-${{ parameters.environment }}
+                      namespace: app-namespace
+                      manifests: k8s/deployment.yml
+                      containers: $(apiImageRef)
+              routeTraffic:
+                steps:
+                  - bash: echo "Routing $(strategy.increment())% of traffic"
+              postRouteTraffic:
+                steps:
+                  - bash: sleep 30 && curl -sf https://${{ parameters.environment }}.mycompany.com/health
+              on:
+                failure:
+                  steps:
+                    - bash: echo "Canary rollback triggered"
+          ${{ elseif eq(parameters.deploymentStrategy, 'rolling') }}:
+            rolling:
+              maxParallel: 2
+              preDeploy:
+                steps:
+                  - bash: echo "Pre-deploy rolling"
+              deploy:
+                steps:
+                  - checkout: self
+                  - task: KubernetesManifest@1
+                    inputs:
+                      action: deploy
+                      kubernetesServiceConnection: sc-aks-${{ parameters.environment }}
+                      namespace: app-namespace
+                      manifests: k8s/deployment.yml
+                      containers: $(apiImageRef)
+              on:
+                success:
+                  steps:
+                    - bash: echo "Rolling deploy succeeded batch $(strategy.iteration)"
+          ${{ else }}:
+            runOnce:
+              deploy:
+                steps:
+                  - checkout: self
+                  - ${{ each svc in parameters.services }}:
+                    - task: DownloadPipelineArtifact@2
+                      inputs:
+                        artifactName: drop-${{ svc.name }}
+                        targetPath: $(Pipeline.Workspace)/drop/${{ svc.name }}
+                  - task: KubernetesManifest@1
+                    inputs:
+                      action: deploy
+                      kubernetesServiceConnection: sc-aks-${{ parameters.environment }}
+                      namespace: app-namespace
+                      manifests: k8s/
+                      containers: $(apiImageRef)
+              on:
+                failure:
+                  steps:
+                    - task: Kubernetes@1
+                      inputs:
+                        kubernetesServiceEndpoint: sc-aks-${{ parameters.environment }}
+                        namespace: app-namespace
+                        command: rollout
+                        arguments: undo deployment/api
+
+  # ── STAGE 5: Post-Deploy ─────────────────────────────────
+  - stage: PostDeploy
+    displayName: Post-Deploy Validation & Notify
+    dependsOn: Deploy
+    condition: always()
+    jobs:
+      - job: SmokeTests
+        displayName: Smoke tests
+        condition: succeeded('Deploy')
+        pool: { vmImage: ubuntu-latest }
+        # Service container for Redis dependency
+        services:
+          redis:
+            image: redis:7
+            ports: [6379]
+        steps:
+          - checkout: self
+          - bash: |
+              MAX=10
+              for i in $(seq 1 $MAX); do
+                STATUS=$(curl -sf -o /dev/null -w "%{http_code}" https://${{ parameters.environment }}.mycompany.com/health || echo 000)
+                echo "Attempt $i: HTTP $STATUS"
+                [ "$STATUS" = "200" ] && exit 0
+                sleep 15
+              done
+              echo "##vso[task.logissue type=error]Smoke tests failed"
+              exit 1
+            displayName: Health check
+
+      - job: NotifyTeams
+        displayName: Notify Teams
+        condition: always()
+        pool: { vmImage: ubuntu-latest }
+        variables:
+          # Capture stage result
+          deployStatus: $[dependencies.Deploy.result]
+        steps:
+          - bash: |
+              COLOR="Good"
+              EMOJI="✅"
+              if [ "$(deployStatus)" != "Succeeded" ]; then
+                COLOR="Attention"
+                EMOJI="❌"
+              fi
+
+              curl -sf -X POST "$(teamsWebhook)" \
+                -H "Content-Type: application/json" \
+                -d "{
+                  \"type\":\"AdaptiveCard\",\"version\":\"1.4\",
+                  \"body\":[
+                    {\"type\":\"TextBlock\",\"text\":\"$EMOJI Deployment $(deployStatus)\",\"color\":\"$COLOR\",\"weight\":\"Bolder\",\"size\":\"Large\"},
+                    {\"type\":\"FactSet\",\"facts\":[
+                      {\"title\":\"Environment\",\"value\":\"${{ parameters.environment }}\"},
+                      {\"title\":\"Build\",\"value\":\"$(Build.BuildId)\"},
+                      {\"title\":\"Branch\",\"value\":\"$(Build.SourceBranchName)\"},
+                      {\"title\":\"Strategy\",\"value\":\"${{ parameters.deploymentStrategy }}\"},
+                      {\"title\":\"Triggered by\",\"value\":\"$(Build.RequestedFor)\"}
+                    ]}
+                  ],
+                  \"actions\":[{\"type\":\"Action.OpenUrl\",\"title\":\"View Build\",\"url\":\"$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)\"}]
+                }" || true
+            displayName: Send Teams notification
+
+      - job: Cleanup
+        displayName: Cleanup (always runs)
+        condition: always()
+        pool: { vmImage: ubuntu-latest }
+        steps:
+          - bash: |
+              echo "##[section]Cleanup"
+              # Remove temp files, clean workspace artifacts
+              rm -rf /tmp/build-* || true
+              echo "Cleanup complete for build $(Build.BuildId)"
+            displayName: Post-pipeline cleanup

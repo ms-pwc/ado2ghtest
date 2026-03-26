@@ -1,0 +1,310 @@
+# ============================================================
+# Pipeline 90: Cost Optimization Pipeline
+# Complexity: Highly Complex
+# Concepts: Azure Cost Management API, Azure Advisor
+#           recommendations, auto-resize underutilized VMs,
+#           orphaned resource detection, reserved instance
+#           recommendations, budget alert configuration,
+#           cost attribution tagging, savings report
+# ============================================================
+
+trigger: none   # Manual or scheduled only
+
+schedules:
+  - cron: '0 6 * * 1'    # Every Monday at 06:00 UTC
+    displayName: Weekly cost review
+    branches:
+      include: [main]
+    always: true
+
+parameters:
+  - name: subscriptionIds
+    type: object
+    default:
+      - id: sub-prod-001
+        name: Production
+      - id: sub-nonprod-001
+        name: Non-Production
+  - name: costThresholdUSD
+    type: number
+    default: 5000
+    displayName: Monthly cost alert threshold (USD)
+  - name: applyRecommendations
+    type: boolean
+    default: false
+    displayName: Auto-apply Advisor recommendations
+  - name: reportRecipients
+    type: string
+    default: platform-team@mycompany.com
+
+variables:
+  - group: cost-optimization-vars
+  - name: lookbackDays
+    value: 30
+  - name: reportDate
+    value: $(date +%Y-%m-%d)
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: GatherCostData
+    displayName: Gather Cost & Usage Data
+    jobs:
+      - job: CostAnalysis
+        steps:
+          - bash: pip install azure-mgmt-costmanagement azure-identity pandas matplotlib
+            displayName: Install cost tools
+
+          - task: AzureCLI@2
+            displayName: Export cost data per subscription
+            inputs:
+              azureSubscription: sc-azure-cost
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                mkdir -p cost-reports
+
+                ${{ each sub in parameters.subscriptionIds }}:
+
+                  echo "=== Cost data for ${{ sub.name }} (${{ sub.id }}) ==="
+
+                  # Get current month costs
+                  CURRENT_COST=$(az consumption usage list \
+                    --subscription ${{ sub.id }} \
+                    --start-date $(date -d 'first day of this month' +%Y-%m-%d) \
+                    --end-date $(date +%Y-%m-%d) \
+                    --query "[].{cost:pretaxCost,currency:currency}" \
+                    -o json | python3 -c "
+                  import json,sys
+                  data = json.load(sys.stdin)
+                  total = sum(float(x['cost']) for x in data if x['cost'])
+                  print(f'{total:.2f}')
+                  ")
+                  echo "${{ sub.name }} current month cost: \$$CURRENT_COST"
+
+                  # Get cost by resource group
+                  az cost management query \
+                    --scope "subscriptions/${{ sub.id }}" \
+                    --type Usage \
+                    --timeframe MonthToDate \
+                    --dataset-granularity Daily \
+                    --dataset-aggregation '{"totalCost":{"name":"Cost","function":"Sum"}}' \
+                    --dataset-grouping '{"type":"Dimension","name":"ResourceGroup"}' \
+                    -o json > cost-reports/${{ sub.id }}-by-rg.json || true
+
+                  echo "##vso[task.setvariable variable=cost_${{ sub.name }};isOutput=true]$CURRENT_COST"
+              name: costData
+
+          - task: AzureCLI@2
+            displayName: Check budget thresholds
+            inputs:
+              azureSubscription: sc-azure-cost
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az consumption budget list \
+                  --query "[].{name:name,limit:amount,current:currentSpend.amount,currency:currentSpend.unit}" \
+                  -o table
+
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: cost-reports
+              artifactName: cost-data
+
+  - stage: AdvisorRecommendations
+    displayName: Azure Advisor Cost Recommendations
+    dependsOn: GatherCostData
+    jobs:
+      - job: GetRecommendations
+        steps:
+          - task: AzureCLI@2
+            displayName: Get Advisor recommendations
+            inputs:
+              azureSubscription: sc-azure-cost
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                mkdir -p advisor-reports
+
+                ${{ each sub in parameters.subscriptionIds }}:
+
+                  echo "=== Advisor for ${{ sub.name }} ==="
+                  az advisor recommendation list \
+                    --subscription ${{ sub.id }} \
+                    --category Cost \
+                    --query "sort_by([],&extendedProperties.annualSavingsAmount) | reverse(@)" \
+                    -o json > advisor-reports/${{ sub.id }}-recommendations.json
+
+                  # Top 10 cost savings
+                  cat advisor-reports/${{ sub.id }}-recommendations.json | python3 -c "
+                  import json, sys
+                  recs = json.load(sys.stdin)
+                  print(f'Top cost recommendations for ${{ sub.name }}:')
+                  for i, r in enumerate(recs[:10], 1):
+                      annual = r.get('extendedProperties', {}).get('annualSavingsAmount', 0)
+                      resource = r.get('resourceName', r.get('impactedValue', 'N/A'))
+                      print(f'{i}. {r[\"shortDescription\"][\"solution\"][:80]} | Resource: {resource} | Annual savings: \${annual}')
+                  "
+
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: advisor-reports
+              artifactName: advisor-recommendations
+
+  - stage: OrphanedResources
+    displayName: Detect Orphaned Resources
+    dependsOn: GatherCostData
+    jobs:
+      - job: FindOrphans
+        steps:
+          - task: AzureCLI@2
+            displayName: Find unattached disks
+            inputs:
+              azureSubscription: sc-azure-cost
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                echo "=== Unattached Managed Disks ==="
+                az disk list \
+                  --query "[?diskState=='Unattached'].{name:name,rg:resourceGroup,size:diskSizeGb,sku:sku.name,created:timeCreated}" \
+                  -o table | tee orphaned-disks.txt
+
+                DISK_COUNT=$(az disk list --query "length([?diskState=='Unattached'])" -o tsv)
+                echo "##vso[task.setvariable variable=orphanedDiskCount]$DISK_COUNT"
+
+          - task: AzureCLI@2
+            displayName: Find unused public IPs
+            inputs:
+              azureSubscription: sc-azure-cost
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                echo "=== Unused Public IP Addresses ==="
+                az network public-ip list \
+                  --query "[?ipConfiguration==null].{name:name,rg:resourceGroup,sku:sku.name}" \
+                  -o table | tee orphaned-ips.txt
+
+          - task: AzureCLI@2
+            displayName: Find empty NSGs
+            inputs:
+              azureSubscription: sc-azure-cost
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                echo "=== NSGs with no subnets/NICs ==="
+                az network nsg list \
+                  --query "[?subnets==[] && networkInterfaces==[]].{name:name,rg:resourceGroup}" \
+                  -o table | tee orphaned-nsgs.txt
+
+          - task: AzureCLI@2
+            displayName: Find idle App Service Plans
+            inputs:
+              azureSubscription: sc-azure-cost
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                echo "=== App Service Plans with 0 apps ==="
+                az appservice plan list \
+                  --query "[?numberOfSites==\`0\`].{name:name,rg:resourceGroup,sku:sku.name,tier:sku.tier}" \
+                  -o table | tee idle-appservice-plans.txt
+
+  - stage: AutoRemediate
+    displayName: Auto-Apply Cost Recommendations
+    dependsOn: AdvisorRecommendations
+    condition: and(succeeded(), eq('${{ parameters.applyRecommendations }}', 'true'))
+    jobs:
+      - deployment: ApplyRecommendations
+        environment: cost-optimization
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureCLI@2
+                  displayName: Apply Advisor recommendations
+                  inputs:
+                    azureSubscription: sc-azure-cost
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      # Only apply "low effort" recommendations
+                      az advisor recommendation list \
+                        --category Cost \
+                        --query "[?impactedField=='Microsoft.Compute/virtualMachines' && impactedValue!=null]" \
+                        -o json | python3 -c "
+                      import json, sys, subprocess
+                      recs = json.load(sys.stdin)
+                      for r in recs[:5]:  # Limit to top 5
+                          rec_id = r['id']
+                          print(f'Would remediate: {rec_id}')
+                          # subprocess.run(['az', 'advisor', 'recommendation', 'remediate', '--ids', rec_id])
+                      print('Dry-applied (uncomment subprocess line to actually apply)')
+                      "
+
+  - stage: GenerateReport
+    displayName: Generate & Send Cost Report
+    dependsOn:
+      - OrphanedResources
+      - AdvisorRecommendations
+    condition: always()
+    jobs:
+      - job: Report
+        steps:
+          - bash: pip install jinja2 markdown
+            displayName: Install report tools
+
+          - task: DownloadPipelineArtifact@2
+            inputs:
+              pattern: '**'
+              targetPath: $(Pipeline.Workspace)/artifacts
+
+          - bash: |
+              cat <<'EOF' > cost-report.md
+              # Weekly Cost Optimization Report
+              **Date:** $(date -u)
+              **Period:** Last $(lookbackDays) days
+
+              ## Summary
+              | Subscription | Monthly Cost | Change |
+              |---|---|---|
+              ${{ each sub in parameters.subscriptionIds }}:
+              | ${{ sub.name }} | See logs | N/A |
+
+              ## Top Savings Opportunities
+              See advisor-recommendations artifact for details.
+
+              ## Orphaned Resources
+              - Unattached disks: $(orphanedDiskCount)
+              - See orphaned-disks.txt, orphaned-ips.txt, idle-appservice-plans.txt
+
+              ## Recommended Actions
+              1. Delete/snapshot unattached disks older than 30 days
+              2. Release unused public IP addresses
+              3. Delete empty App Service Plans
+              4. Review Advisor recommendations and apply safe ones
+
+              ---
+              *Report generated by ADO Pipeline $(Build.BuildId)*
+              EOF
+
+              cat cost-report.md
+            displayName: Generate cost report
+
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: cost-report.md
+              artifactName: cost-report
+
+          - bash: |
+              # Send report via Logic App (email workflow)
+              REPORT_CONTENT=$(cat cost-report.md | base64 -w 0)
+              curl -sf -X POST "$(costReportLogicAppUrl)" \
+                -H "Content-Type: application/json" \
+                -d "{
+                  \"to\": \"${{ parameters.reportRecipients }}\",
+                  \"subject\": \"Weekly Cost Optimization Report – $(date +%Y-%m-%d)\",
+                  \"body\": \"$REPORT_CONTENT\",
+                  \"buildId\": \"$(Build.BuildId)\"
+                }" || true
+            displayName: Send report via email

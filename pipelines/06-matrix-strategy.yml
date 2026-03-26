@@ -1,0 +1,138 @@
+# ============================================================
+# Pipeline 06: Matrix Strategy
+# Concepts: strategy.matrix, maxParallel, include/exclude,
+#           matrix variables, cross-platform builds
+# ============================================================
+
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+
+pool:
+  vmImage: ubuntu-latest   # overridden per matrix leg below
+
+stages:
+
+  # ── Cross-platform build matrix ──────────────────────────────
+  - stage: CrossPlatformBuild
+    displayName: Cross-Platform Build
+    jobs:
+      - job: Build
+        displayName: Build on $(osName) / Node $(nodeVersion)
+        strategy:
+          matrix:
+            # Each key becomes a separate parallel job leg
+            Linux_Node18:
+              osName: Linux
+              nodeVersion: '18.x'
+              vmImage: ubuntu-latest
+            Linux_Node20:
+              osName: Linux
+              nodeVersion: '20.x'
+              vmImage: ubuntu-latest
+            Windows_Node18:
+              osName: Windows
+              nodeVersion: '18.x'
+              vmImage: windows-latest
+            Windows_Node20:
+              osName: Windows
+              nodeVersion: '20.x'
+              vmImage: windows-latest
+            macOS_Node20:
+              osName: macOS
+              nodeVersion: '20.x'
+              vmImage: macOS-latest
+          maxParallel: 3    # run at most 3 legs simultaneously
+        pool:
+          vmImage: $(vmImage)   # use the matrix variable
+        steps:
+          - checkout: self
+
+          - task: NodeTool@0
+            displayName: Use Node.js $(nodeVersion)
+            inputs:
+              versionSpec: $(nodeVersion)
+
+          - script: |
+              node --version
+              npm --version
+              npm ci
+            displayName: Install dependencies
+
+          - script: npm test -- --ci
+            displayName: Run tests on $(osName)
+
+  # ── .NET multi-TFM matrix ─────────────────────────────────────
+  - stage: DotNetMatrix
+    displayName: .NET Multi-TFM
+    dependsOn: []           # run in parallel with CrossPlatformBuild
+    jobs:
+      - job: DotNetBuild
+        displayName: Build TFM $(targetFramework)
+        strategy:
+          matrix:
+            net6:
+              targetFramework: net6.0
+            net7:
+              targetFramework: net7.0
+            net8:
+              targetFramework: net8.0
+          maxParallel: 2
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: self
+
+          - task: UseDotNet@2
+            displayName: Install .NET for $(targetFramework)
+            inputs:
+              packageType: sdk
+              version: |
+                ${{ if eq(variables.targetFramework, 'net6.0') }}
+                  6.x
+                ${{ elseif eq(variables.targetFramework, 'net7.0') }}
+                  7.x
+                ${{ else }}
+                  8.x
+
+          - script: |
+              dotnet build -f $(targetFramework)
+            displayName: Build for $(targetFramework)
+
+  # ── Python version matrix ─────────────────────────────────────
+  - stage: PythonMatrix
+    displayName: Python Version Matrix
+    dependsOn: []
+    jobs:
+      - job: PythonTest
+        displayName: Test Python $(pythonVersion)
+        strategy:
+          matrix:
+            Py310:
+              pythonVersion: '3.10'
+            Py311:
+              pythonVersion: '3.11'
+            Py312:
+              pythonVersion: '3.12'
+          maxParallel: 3
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - task: UsePythonVersion@0
+            displayName: Use Python $(pythonVersion)
+            inputs:
+              versionSpec: $(pythonVersion)
+
+          - script: |
+              python -m pip install --upgrade pip
+              pip install -r requirements.txt
+              pytest --junitxml=test-results.xml
+            displayName: Install & test
+
+          - task: PublishTestResults@2
+            condition: succeededOrFailed()
+            inputs:
+              testResultsFormat: JUnit
+              testResultsFiles: test-results.xml

@@ -1,0 +1,67 @@
+# ============================================================
+# Pipeline 04: Templates
+# Concepts: step templates, job templates, stage templates,
+#           template parameters (string, boolean, stepList),
+#           each expression, template nesting
+# ============================================================
+
+trigger:
+  branches:
+    include:
+      - main
+      - release/*
+
+# ── Use a stage template ─────────────────────────────────────
+# The stage-build template defines the entire Build stage.
+stages:
+
+  - template: templates/stage-build.yml
+    parameters:
+      buildConfig: Release
+      pool: ubuntu-latest
+
+  # ── Inline stage that uses a job template ───────────────────
+  - stage: DeployStaging
+    displayName: Deploy to Staging
+    dependsOn: Build
+    jobs:
+      - template: templates/job-deploy.yml
+        parameters:
+          environmentName: Staging
+          serviceConnection: sc-azure-staging
+          artifactName: drop
+          # Inject extra steps via the stepList parameter
+          extraSteps:
+            - script: echo "Running smoke tests against Staging"
+              displayName: Smoke tests (Staging)
+
+  - stage: DeployProd
+    displayName: Deploy to Production
+    dependsOn: DeployStaging
+    condition: and(succeeded(), eq(variables['Build.SourceBranchName'], 'main'))
+    jobs:
+      - template: templates/job-deploy.yml
+        parameters:
+          environmentName: Production
+          serviceConnection: sc-azure-prod
+          artifactName: drop
+          extraSteps:
+            - script: echo "Notifying Slack of production deployment"
+              displayName: Slack notification
+
+  # ── Inline job using a step template directly ────────────────
+  - stage: Extras
+    displayName: Additional checks
+    dependsOn: []            # run in parallel with Build stage
+    jobs:
+      - job: LintJob
+        displayName: Linting
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: self
+          # Reuse steps template; skip tests to keep this job fast
+          - template: templates/steps-build.yml
+            parameters:
+              buildConfig: Debug
+              runTests: false

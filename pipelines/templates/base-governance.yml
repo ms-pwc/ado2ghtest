@@ -1,0 +1,120 @@
+# ============================================================
+# Base Governance Template: templates/base-governance.yml
+# Concepts: extends base, enforced steps, parameter validation,
+#           required pools, stepList injection, audit log
+# ============================================================
+
+parameters:
+  - name: targetEnvironment
+    type: string
+    values:
+      - dev
+      - staging
+      - production
+
+  - name: buildSteps
+    type: stepList
+    default: []
+
+  - name: postDeploySteps
+    type: stepList
+    default: []
+
+  # Restrict which agent pools are allowed
+  - name: agentPool
+    type: string
+    default: ubuntu-latest
+    values:
+      - ubuntu-latest
+      - windows-latest
+      - self-hosted-approved
+
+trigger:
+  branches:
+    include: [main, release/*]
+
+pool:
+  vmImage: ${{ parameters.agentPool }}
+
+stages:
+
+  # ── Mandatory: Security scan (teams cannot remove this) ──────
+  - stage: MandatorySecurityScan
+    displayName: '[REQUIRED] Security Scan'
+    jobs:
+      - job: SecurityGate
+        steps:
+          - checkout: self
+          # This step is always injected by the base template
+          - bash: |
+              echo "=== Corporate Security Gate ==="
+              echo "Repository : $(Build.Repository.Name)"
+              echo "Branch     : $(Build.SourceBranchName)"
+              echo "Requestor  : $(Build.RequestedFor)"
+              echo "Running mandatory vulnerability scan..."
+              # Placeholder for: trivy, snyk, checkov, etc.
+              echo "Security scan PASSED"
+            displayName: Corporate security scan
+
+          - bash: |
+              echo "=== Audit Log ==="
+              curl -s -X POST \
+                "https://audit.mycompany.com/api/pipeline-run" \
+                -H 'Content-Type: application/json' \
+                -d "{
+                  \"buildId\": \"$(Build.BuildId)\",
+                  \"project\": \"$(System.TeamProject)\",
+                  \"repo\": \"$(Build.Repository.Name)\",
+                  \"branch\": \"$(Build.SourceBranchName)\",
+                  \"requestedBy\": \"$(Build.RequestedFor)\",
+                  \"environment\": \"${{ parameters.targetEnvironment }}\"
+                }" || echo "Audit endpoint not reachable (non-blocking)"
+            displayName: Audit log entry
+            continueOnError: true
+
+  # ── Team-supplied build steps ────────────────────────────────
+  - stage: Build
+    displayName: Build
+    dependsOn: MandatorySecurityScan
+    jobs:
+      - job: BuildJob
+        steps:
+          - checkout: self
+          # Inject team's build steps
+          - ${{ each step in parameters.buildSteps }}:
+            - ${{ step }}
+
+  # ── Mandatory: Deploy to target environment ──────────────────
+  - stage: Deploy
+    displayName: Deploy to ${{ parameters.targetEnvironment }}
+    dependsOn: Build
+    jobs:
+      - deployment: Deploy
+        environment: ${{ parameters.targetEnvironment }}
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - bash: echo "Deploying to ${{ parameters.targetEnvironment }}..."
+                  displayName: Base deploy step
+
+                # Inject team's post-deploy steps
+                - ${{ each step in parameters.postDeploySteps }}:
+                  - ${{ step }}
+
+  # ── Mandatory: Compliance report (always runs) ───────────────
+  - stage: ComplianceReport
+    displayName: '[REQUIRED] Compliance Report'
+    dependsOn: Deploy
+    condition: always()
+    jobs:
+      - job: Report
+        steps:
+          - bash: |
+              echo "=== Compliance Report ==="
+              echo "Pipeline   : $(Build.DefinitionName)"
+              echo "Build      : $(Build.BuildNumber)"
+              echo "Environment: ${{ parameters.targetEnvironment }}"
+              echo "Result     : $(Agent.JobStatus)"
+              echo "Timestamp  : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            displayName: Generate compliance report

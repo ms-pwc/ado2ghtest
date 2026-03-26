@@ -1,0 +1,186 @@
+# ============================================================
+# Pipeline 58: Full IaC Lifecycle – Bicep + Tests
+# Complexity: Complex
+# Concepts: Bicep compile, what-if, deploy, ARM TTK tests,
+#           Pester infra tests, resource tagging, drift detection
+# ============================================================
+
+trigger:
+  branches:
+    include: [main]
+  paths:
+    include: [infra/**, bicep/**]
+
+parameters:
+  - name: environment
+    type: string
+    default: staging
+    values: [dev, staging, production]
+  - name: destroyAfterTest
+    type: boolean
+    default: false
+
+variables:
+  azureServiceConnection: sc-azure-prod
+  resourceGroup: rg-myapp-${{ parameters.environment }}
+  location: eastus
+  templateFile: infra/main.bicep
+  testRgName: rg-myapp-${{ parameters.environment }}-test
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: BicepValidate
+    displayName: Validate & Test Bicep
+    jobs:
+      - job: Validate
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: Install Bicep & compile
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az bicep install
+                echo "=== Bicep Version ==="
+                az bicep version
+                
+                echo "=== Compile all .bicep files ==="
+                find infra/ -name "*.bicep" | while read f; do
+                  echo "Compiling: $f"
+                  az bicep build --file "$f"
+                done
+
+          # ARM Template Toolkit (ARM TTK) tests
+          - task: PowerShell@2
+            displayName: ARM TTK tests
+            inputs:
+              targetType: inline
+              pwsh: true
+              script: |
+                Install-Module -Name arm-ttk -Force -AllowClobber
+                Import-Module arm-ttk
+                
+                $results = Test-AzTemplate -TemplatePath 'infra/' -Recurse
+                $results | Format-Table -AutoSize
+                
+                $failures = $results | Where-Object { -Not $_.Passed }
+                if ($failures.Count -gt 0) {
+                  Write-Error "ARM TTK failures: $($failures.Count)"
+                  exit 1
+                }
+                Write-Host "All ARM TTK tests passed!"
+
+          - task: AzureCLI@2
+            displayName: What-If deployment preview
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az deployment group what-if \
+                  --resource-group $(resourceGroup) \
+                  --template-file $(templateFile) \
+                  --parameters @infra/parameters/${{ parameters.environment }}.parameters.json \
+                  --parameters buildId=$(Build.BuildId) \
+                  --mode Incremental
+
+  - stage: DeployInfra
+    displayName: Deploy Infrastructure
+    dependsOn: BicepValidate
+    jobs:
+      - deployment: BicepDeploy
+        environment: ${{ parameters.environment }}
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: AzureCLI@2
+                  displayName: Deploy Bicep
+                  name: deploy
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      DEPLOYMENT=$(az deployment group create \
+                        --resource-group $(resourceGroup) \
+                        --template-file $(templateFile) \
+                        --parameters @infra/parameters/${{ parameters.environment }}.parameters.json \
+                        --parameters buildId=$(Build.BuildId) \
+                        --name "deploy-$(Build.BuildId)" \
+                        --query properties.outputs -o json)
+                      
+                      echo "Deployment outputs: $DEPLOYMENT"
+                      
+                      WEB_URL=$(echo $DEPLOYMENT | python3 -c "import sys,json; print(json.load(sys.stdin).get('webAppUrl',{}).get('value',''))" 2>/dev/null)
+                      echo "##vso[task.setvariable variable=webAppUrl;isOutput=true]$WEB_URL"
+
+  - stage: TestInfra
+    displayName: Infrastructure Tests (Pester)
+    dependsOn: DeployInfra
+    variables:
+      webAppUrl: $[ stageDependencies.DeployInfra.BicepDeploy.outputs['deploy.webAppUrl'] ]
+    jobs:
+      - job: PesterTests
+        steps:
+          - checkout: self
+
+          - task: PowerShell@2
+            displayName: Pester infrastructure tests
+            inputs:
+              targetType: inline
+              pwsh: true
+              script: |
+                Install-Module -Name Pester -Force -MinimumVersion 5.0
+                Install-Module -Name Az -Force -AllowClobber
+                
+                $config = New-PesterConfiguration
+                $config.Run.Path = 'infra/tests/'
+                $config.TestResult.Enabled = $true
+                $config.TestResult.OutputPath = '$(Agent.TempDirectory)/infra-test-results.xml'
+                
+                $result = Invoke-Pester -Configuration $config
+                if ($result.FailedCount -gt 0) { exit 1 }
+            env:
+              WEBAPP_URL: $(webAppUrl)
+
+          - task: PublishTestResults@2
+            condition: always()
+            inputs:
+              testResultsFormat: NUnit
+              testResultsFiles: $(Agent.TempDirectory)/infra-test-results.xml
+
+  - stage: DriftDetection
+    displayName: Drift Detection
+    dependsOn: TestInfra
+    condition: succeeded()
+    jobs:
+      - job: DetectDrift
+        steps:
+          - task: AzureCLI@2
+            displayName: Check for configuration drift
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                echo "Running what-if to detect post-deploy drift..."
+                CHANGES=$(az deployment group what-if \
+                  --resource-group $(resourceGroup) \
+                  --template-file $(templateFile) \
+                  --parameters @infra/parameters/${{ parameters.environment }}.parameters.json \
+                  --query "changes[?type == 'Modify'] | length(@)" \
+                  --mode Complete 2>/dev/null || echo "0")
+                
+                echo "Drift changes detected: $CHANGES"
+                if [ "$CHANGES" -gt 0 ]; then
+                  echo "WARNING: Configuration drift detected!"
+                fi

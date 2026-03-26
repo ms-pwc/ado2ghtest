@@ -1,0 +1,169 @@
+# ============================================================
+# Pipeline 68: Scheduled Cleanup & Maintenance
+# Complexity: Complex
+# Concepts: scheduled triggers, Azure resource cleanup,
+#           ACR image pruning, old build artifact deletion,
+#           cost management, disk space reclamation
+# ============================================================
+
+trigger: none    # Only scheduled or manual
+
+schedules:
+  - cron: '0 1 * * 0'     # Every Sunday 01:00 UTC
+    displayName: Weekly cleanup
+    branches:
+      include: [main]
+    always: true
+
+  - cron: '0 22 * * *'    # Daily at 22:00 UTC
+    displayName: Daily branch cleanup
+    branches:
+      include: [main]
+    always: false          # skip if no changes
+
+parameters:
+  - name: dryRun
+    displayName: Dry Run (no deletions)
+    type: boolean
+    default: true
+
+  - name: imageRetentionDays
+    displayName: ACR Image Retention (days)
+    type: number
+    default: 30
+
+  - name: artifactRetentionDays
+    displayName: Build Artifact Retention (days)
+    type: number
+    default: 14
+
+variables:
+  azureServiceConnection: sc-azure-prod
+  containerRegistry: myacr.azurecr.io
+  acrName: myacr
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: CleanupACR
+    displayName: Prune ACR Images
+    jobs:
+      - job: PruneImages
+        steps:
+          - task: AzureCLI@2
+            displayName: List old ACR images
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                CUTOFF=$(date -u -d "-${{ parameters.imageRetentionDays }} days" +%Y-%m-%dT%H:%M:%SZ)
+                echo "Cutoff date: $CUTOFF"
+                echo ""
+                echo "Repositories to scan:"
+                az acr repository list --name $(acrName) --output tsv
+
+          - task: AzureCLI@2
+            displayName: ${{ if parameters.dryRun }}Delete old images (DRY RUN)${{ else }}Delete old images${{ end }}
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                DRY_RUN="${{ parameters.dryRun }}"
+                CUTOFF=$(date -u -d "-${{ parameters.imageRetentionDays }} days" +%Y-%m-%dT%H:%M:%SZ)
+                
+                REPOS=$(az acr repository list --name $(acrName) -o tsv)
+                
+                for REPO in $REPOS; do
+                  echo "Processing: $REPO"
+                  
+                  MANIFESTS=$(az acr manifest list-metadata \
+                    --registry $(acrName) \
+                    --name "$REPO" \
+                    --query "[?tags[0]==null || (lastUpdateTime < '$CUTOFF' && !contains(tags,'latest'))].digest" \
+                    -o tsv)
+                  
+                  if [ -z "$MANIFESTS" ]; then
+                    echo "  No old images found in $REPO"
+                    continue
+                  fi
+                  
+                  for DIGEST in $MANIFESTS; do
+                    if [ "$DRY_RUN" = "True" ]; then
+                      echo "  [DRY RUN] Would delete: $REPO@$DIGEST"
+                    else
+                      echo "  Deleting: $REPO@$DIGEST"
+                      az acr repository delete \
+                        --name $(acrName) \
+                        --image "$REPO@$DIGEST" \
+                        --yes || true
+                    fi
+                  done
+                done
+
+  - stage: CleanupADOBuilds
+    displayName: Cleanup Old ADO Build Artifacts
+    dependsOn: []
+    jobs:
+      - job: PruneArtifacts
+        steps:
+          - bash: |
+              ORG="myorg"
+              PROJECT="MyProject"
+              CUTOFF_DAYS=${{ parameters.artifactRetentionDays }}
+              
+              echo "Build artifacts older than $CUTOFF_DAYS days:"
+              
+              # Calculate cutoff date
+              CUTOFF=$(date -u -d "-${CUTOFF_DAYS} days" +%Y-%m-%dT%H:%M:%SZ)
+              
+              # List old builds via ADO REST API
+              BUILDS=$(curl -s \
+                -H "Authorization: Basic $(echo -n :$(ADO_PAT) | base64)" \
+                "https://dev.azure.com/$ORG/$PROJECT/_apis/build/builds?queryOrder=finishTimeDescending&statusFilter=completed&maxBuildsPerDefinition=1000&api-version=7.1" \
+                | python3 -c "
+              import sys, json
+              from datetime import datetime, timezone
+              builds = json.load(sys.stdin).get('value', [])
+              cutoff = datetime.fromisoformat('${CUTOFF}'.replace('Z','+00:00'))
+              old = [b['id'] for b in builds 
+                     if datetime.fromisoformat(b.get('finishTime','2099-01-01T00:00:00+00:00').replace('Z','+00:00')) < cutoff]
+              print('\n'.join(str(i) for i in old[:50]))
+              " 2>/dev/null)
+              
+              echo "Old builds to clean: $(echo "$BUILDS" | wc -l)"
+            displayName: List old builds
+            env:
+              ADO_PAT: $(ADO_PAT)
+
+  - stage: CleanupStaleBranches
+    displayName: Report Stale Branches
+    dependsOn: []
+    jobs:
+      - job: StaleBranches
+        steps:
+          - checkout: self
+            fetchDepth: 0
+
+          - bash: |
+              STALE_DAYS=90
+              echo "Branches with no commits in $STALE_DAYS days:"
+              
+              git for-each-ref \
+                --sort=-committerdate refs/remotes/origin \
+                --format='%(committerdate:iso8601)|%(refname:short)|%(authorname)' \
+              | awk -F'|' -v cutoff="$(date -u -d "-$STALE_DAYS days" +%Y-%m-%d)" '
+                {
+                  split($1, d, " ")
+                  if (d[1] < cutoff && $2 !~ /HEAD/ && $2 !~ /main/ && $2 !~ /develop/) {
+                    print "  " d[1] " | " $2 " | " $3
+                  }
+                }
+              ' | head -30
+              
+              echo ""
+              echo "(Report only – no branches deleted.)"
+            displayName: List stale branches

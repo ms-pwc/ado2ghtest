@@ -1,0 +1,113 @@
+# ============================================================
+# Pipeline 27: NuGet – Pack, Version & Publish to Azure Artifacts
+# Complexity: Medium
+# Concepts: NuGetToolInstaller, NuGetCommand, DotNetCoreCLI pack,
+#           feed authentication, versioning, symbol packages
+# ============================================================
+
+trigger:
+  branches:
+    include: [main, release/*]
+  paths:
+    include: ['**/*.csproj', '**/*.nuspec']
+
+variables:
+  buildConfiguration: Release
+  nugetFeedName: mycompany-feed    # Azure Artifacts feed name
+  packageVersion: 1.0.$(Build.BuildId)
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: Build
+    jobs:
+      - job: BuildAndPack
+        steps:
+          - checkout: self
+
+          - task: UseDotNet@2
+            displayName: Install .NET 8
+            inputs:
+              packageType: sdk
+              version: '8.x'
+
+          # Restore NuGet packages (authenticated)
+          - task: NuGetAuthenticate@1
+            displayName: Authenticate NuGet feeds
+
+          - task: DotNetCoreCLI@2
+            displayName: dotnet restore
+            inputs:
+              command: restore
+              projects: '**/*.csproj'
+              feedsToUse: select
+              vstsFeed: $(nugetFeedName)
+
+          - task: DotNetCoreCLI@2
+            displayName: dotnet build
+            inputs:
+              command: build
+              projects: '**/*.csproj'
+              arguments: >
+                --configuration $(buildConfiguration)
+                --no-restore
+                /p:Version=$(packageVersion)
+
+          - task: DotNetCoreCLI@2
+            displayName: dotnet test
+            inputs:
+              command: test
+              projects: '**/*.Tests.csproj'
+              arguments: --no-build --configuration $(buildConfiguration)
+              publishTestResults: true
+
+          # Pack into .nupkg
+          - task: DotNetCoreCLI@2
+            displayName: dotnet pack
+            inputs:
+              command: pack
+              packagesToPack: 'src/**/*.csproj'
+              configuration: $(buildConfiguration)
+              packDirectory: $(Build.ArtifactStagingDirectory)/packages
+              nobuild: true
+              versioningScheme: byEnvVar
+              versionEnvVar: packageVersion
+              includeSymbols: true        # create .snupkg symbol package
+
+          - task: PublishPipelineArtifact@1
+            displayName: Publish nupkg artifact
+            inputs:
+              targetPath: $(Build.ArtifactStagingDirectory)/packages
+              artifact: nuget-packages
+
+  - stage: Publish
+    displayName: Publish to Azure Artifacts
+    dependsOn: Build
+    condition: and(succeeded(), eq(variables['Build.SourceBranchName'], 'main'))
+    jobs:
+      - job: PushPackage
+        steps:
+          - download: current
+            artifact: nuget-packages
+
+          - task: NuGetAuthenticate@1
+            displayName: Authenticate NuGet
+
+          # Push .nupkg to Azure Artifacts feed
+          - task: DotNetCoreCLI@2
+            displayName: dotnet nuget push
+            inputs:
+              command: push
+              packagesToPush: $(Pipeline.Workspace)/nuget-packages/**/*.nupkg
+              publishVstsFeed: $(nugetFeedName)
+              allowPackageConflicts: false
+
+          # Push symbol packages separately
+          - task: DotNetCoreCLI@2
+            displayName: Push symbol packages
+            inputs:
+              command: push
+              packagesToPush: $(Pipeline.Workspace)/nuget-packages/**/*.snupkg
+              publishVstsFeed: $(nugetFeedName)

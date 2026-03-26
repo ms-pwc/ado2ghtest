@@ -1,0 +1,149 @@
+# ============================================================
+# Pipeline 43: Go – Multi-Platform Binary Build
+# Complexity: Medium
+# Concepts: GoTool, go build cross-compile, GOOS/GOARCH matrix,
+#           go test with race detector, go vet, golangci-lint
+# ============================================================
+
+trigger:
+  branches:
+    include: [main, develop]
+  paths:
+    include: ['**/*.go', go.mod, go.sum]
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  goVersion: '1.22'
+  moduleName: github.com/myorg/myapp
+  binaryName: myapp
+
+stages:
+
+  - stage: Lint
+    jobs:
+      - job: GolangCI
+        steps:
+          - checkout: self
+
+          - task: GoTool@0
+            displayName: Install Go $(goVersion)
+            inputs:
+              version: $(goVersion)
+
+          - script: go version && go env
+            displayName: Go environment
+
+          - script: go vet ./...
+            displayName: go vet
+
+          - script: |
+              curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh \
+                | sh -s -- -b $(go env GOPATH)/bin v1.56.2
+              golangci-lint run ./... --timeout=5m
+            displayName: golangci-lint
+            continueOnError: true
+
+  - stage: Test
+    dependsOn: Lint
+    jobs:
+      - job: GoTest
+        steps:
+          - checkout: self
+          - task: GoTool@0
+            inputs:
+              version: $(goVersion)
+
+          # Run tests with race detector and coverage
+          - script: |
+              go test -race -coverprofile=coverage.out -covermode=atomic ./...
+              go tool cover -html=coverage.out -o coverage.html
+              go tool cover -func=coverage.out | tail -1
+            displayName: go test (race + coverage)
+
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: coverage.html
+              artifact: go-coverage
+
+  - stage: CrossCompile
+    displayName: Cross-Compile Binaries
+    dependsOn: Test
+    jobs:
+      - job: Build
+        strategy:
+          matrix:
+            linux_amd64:
+              GOOS: linux
+              GOARCH: amd64
+              suffix: linux-amd64
+            linux_arm64:
+              GOOS: linux
+              GOARCH: arm64
+              suffix: linux-arm64
+            windows_amd64:
+              GOOS: windows
+              GOARCH: amd64
+              suffix: windows-amd64.exe
+            darwin_amd64:
+              GOOS: darwin
+              GOARCH: amd64
+              suffix: darwin-amd64
+            darwin_arm64:
+              GOOS: darwin
+              GOARCH: arm64
+              suffix: darwin-arm64
+          maxParallel: 5
+        steps:
+          - checkout: self
+
+          - task: GoTool@0
+            inputs:
+              version: $(goVersion)
+
+          - bash: |
+              mkdir -p dist
+              OUTPUT="dist/$(binaryName)-$(suffix)"
+              echo "Building $OUTPUT (GOOS=$(GOOS) GOARCH=$(GOARCH))..."
+              CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) \
+                go build \
+                  -ldflags="-s -w -X main.version=$(Build.BuildId) -X main.commit=$(Build.SourceVersion)" \
+                  -o "$OUTPUT" \
+                  ./cmd/$(binaryName)/
+              ls -lh dist/
+            displayName: Cross-compile $(suffix)
+            env:
+              GOOS: $(GOOS)
+              GOARCH: $(GOARCH)
+
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: dist
+              artifact: binaries-$(suffix)
+
+  - stage: Package
+    displayName: Package Release
+    dependsOn: CrossCompile
+    jobs:
+      - job: CreateRelease
+        steps:
+          - download: current
+
+          - bash: |
+              mkdir -p release
+              find $(Pipeline.Workspace) -name "$(binaryName)-*" -exec cp {} release/ \;
+              ls -lh release/
+            displayName: Collect binaries
+
+          - task: ArchiveFiles@2
+            inputs:
+              rootFolderOrFile: release
+              archiveType: tar
+              tarCompression: gz
+              archiveFile: $(Build.ArtifactStagingDirectory)/$(binaryName)-$(Build.BuildId)-all-platforms.tar.gz
+
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: $(Build.ArtifactStagingDirectory)
+              artifact: release-bundle

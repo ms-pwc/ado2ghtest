@@ -1,0 +1,140 @@
+# ============================================================
+# Pipeline 11: Container Jobs
+# Concepts: container resource definitions, job-level container,
+#           step-level container (target), service containers
+#           (sidecar), container options, env in containers
+# ============================================================
+
+trigger:
+  branches:
+    include:
+      - main
+
+# ── Container image registry resources ───────────────────────
+resources:
+  containers:
+    # Public Docker Hub image (no service connection needed)
+    - container: node20
+      image: node:20-alpine
+      env:
+        NODE_ENV: test
+
+    # Custom ACR image (requires a service connection)
+    - container: myTestRunner
+      image: myacr.azurecr.io/test-runner:latest
+      endpoint: sc-myacr              # service connection name in ADO
+      options: --memory=2g --cpus=2   # Docker run flags
+      env:
+        CI: 'true'
+
+    # Python 3.11 slim image
+    - container: python311
+      image: python:3.11-slim
+      env:
+        PYTHONDONTWRITEBYTECODE: '1'
+
+stages:
+
+  # ── Stage 1: Entire job runs inside a container ───────────────
+  - stage: ContainerJob
+    displayName: Jobs inside containers
+    jobs:
+
+      # Every step in this job runs inside the node20 container
+      - job: NodeBuildInContainer
+        displayName: Node build (containerized)
+        pool:
+          vmImage: ubuntu-latest
+        container: node20             # job-level container
+        steps:
+          - checkout: self
+          - script: |
+              node --version
+              npm --version
+              npm ci
+              npm test
+            displayName: Build & test in node:20 container
+
+      # Job inside custom ACR container
+      - job: CustomContainerTests
+        displayName: Tests in custom container
+        pool:
+          vmImage: ubuntu-latest
+        container: myTestRunner
+        steps:
+          - checkout: self
+          - script: /usr/local/bin/run-tests.sh
+            displayName: Run tests via custom test runner
+
+  # ── Stage 2: Step-level containers (target) ──────────────────
+  - stage: StepContainers
+    displayName: Per-step containers
+    dependsOn: []
+    jobs:
+      - job: MixedSteps
+        displayName: Steps on different containers
+        pool:
+          vmImage: ubuntu-latest
+        # Define containers available for steps to target
+        container: node20      # default container for the job
+        steps:
+          - checkout: self
+
+          # This step runs in the job's default container (node20)
+          - script: node --version
+            displayName: Node step (default container)
+
+          # Switch a single step to run in python311 container
+          - script: python3 --version
+            displayName: Python step
+            target:
+              container: python311
+
+          # Step running on the host agent (no container)
+          - script: uname -a
+            displayName: Host agent step
+            target:
+              container: host
+
+  # ── Stage 3: Service containers (sidecars) ───────────────────
+  - stage: ServiceContainers
+    displayName: Job with service containers
+    dependsOn: []
+    jobs:
+      - job: IntegrationTests
+        displayName: Integration tests with DB & Redis sidecars
+        pool:
+          vmImage: ubuntu-latest
+        # Service containers run as sidecars alongside the job
+        services:
+          postgres:                          # hostname accessible as 'postgres'
+            image: postgres:15
+            env:
+              POSTGRES_DB: testdb
+              POSTGRES_USER: testuser
+              POSTGRES_PASSWORD: testpass
+            ports:
+              - 5432:5432
+          redis:                            # hostname accessible as 'redis'
+            image: redis:7-alpine
+            ports:
+              - 6379:6379
+        steps:
+          - checkout: self
+
+          - script: |
+              # Wait for Postgres to be ready
+              for i in $(seq 1 30); do
+                pg_isready -h postgres -U testuser && break || sleep 1
+              done
+            displayName: Wait for Postgres
+
+          - script: |
+              echo "Running integration tests with:"
+              echo "  DB    → postgres:5432"
+              echo "  Cache → redis:6379"
+              # e.g. pytest tests/integration/
+            displayName: Run integration tests
+            env:
+              DATABASE_URL: postgresql://testuser:testpass@postgres:5432/testdb
+              REDIS_URL: redis://redis:6379

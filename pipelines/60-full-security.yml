@@ -1,0 +1,192 @@
+# ============================================================
+# Pipeline 60: Full Security Pipeline – SAST + SCA + DAST + Secrets
+# Complexity: Complex
+# Concepts: gitleaks secrets scan, Semgrep SAST, Grype SCA,
+#           ZAP DAST, Microsoft Security DevOps, consolidated
+#           reporting, SARIF, security gate scoring
+# ============================================================
+
+trigger:
+  branches:
+    include: [main, develop]
+
+schedules:
+  - cron: '0 2 * * 1-5'
+    displayName: Nightly security scan
+    branches:
+      include: [main]
+    always: true
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  failOnCritical: true
+  targetUrl: https://myapp-staging.azurewebsites.net
+
+stages:
+
+  - stage: SecretsAndSAST
+    displayName: Secrets Scan + SAST
+    jobs:
+
+      - job: SecretsDetection
+        displayName: Gitleaks – Secret Detection
+        steps:
+          - checkout: self
+            fetchDepth: 0
+
+          - bash: |
+              wget -q https://github.com/gitleaks/gitleaks/releases/download/v8.18.2/gitleaks_8.18.2_linux_x64.tar.gz
+              tar -xzf gitleaks_8.18.2_linux_x64.tar.gz
+              sudo mv gitleaks /usr/local/bin/
+              gitleaks version
+            displayName: Install Gitleaks
+
+          - bash: |
+              gitleaks detect \
+                --source . \
+                --report-format sarif \
+                --report-path $(Agent.TempDirectory)/gitleaks.sarif \
+                --exit-code 0 \
+                || true
+              
+              gitleaks detect \
+                --source . \
+                --report-format json \
+                --report-path $(Agent.TempDirectory)/gitleaks.json \
+                --exit-code 0 \
+                || true
+              
+              SECRETS=$(cat $(Agent.TempDirectory)/gitleaks.json | \
+                python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d) if isinstance(d,list) else 0)" 2>/dev/null || echo 0)
+              
+              echo "Secrets found: $SECRETS"
+              [ "$SECRETS" -eq 0 ] || { echo "CRITICAL: Secrets detected in repository!"; exit 1; }
+            displayName: Run Gitleaks scan
+
+      - job: SemgrepSAST
+        displayName: Semgrep – SAST
+        steps:
+          - checkout: self
+
+          - script: pip install semgrep
+            displayName: Install Semgrep
+
+          - bash: |
+              semgrep scan \
+                --config=auto \
+                --config=p/security-audit \
+                --config=p/owasp-top-ten \
+                --json \
+                --output=$(Agent.TempDirectory)/semgrep-results.json \
+                --sarif \
+                --sarif-output=$(Agent.TempDirectory)/semgrep.sarif \
+                --metrics=off \
+                || true
+              
+              CRITICAL=$(cat $(Agent.TempDirectory)/semgrep-results.json | \
+                python3 -c "
+              import sys, json
+              d = json.load(sys.stdin)
+              crits = [r for r in d.get('results',[]) if r.get('extra',{}).get('severity','') == 'ERROR']
+              print(len(crits))
+              " 2>/dev/null || echo "0")
+              
+              echo "Critical SAST findings: $CRITICAL"
+            displayName: Semgrep scan
+            continueOnError: true
+
+          - task: PublishPipelineArtifact@1
+            condition: always()
+            inputs:
+              targetPath: $(Agent.TempDirectory)/semgrep-results.json
+              artifact: semgrep-results
+
+  - stage: SCA
+    displayName: Software Composition Analysis
+    dependsOn: []
+    jobs:
+      - job: DepScan
+        steps:
+          - checkout: self
+
+          - bash: |
+              curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh \
+                | sh -s -- -b /usr/local/bin
+            displayName: Install Grype
+
+          - bash: |
+              grype dir:. \
+                --fail-on critical \
+                -o json \
+                --file $(Agent.TempDirectory)/grype-results.json \
+                || true
+              
+              CRIT=$(cat $(Agent.TempDirectory)/grype-results.json | \
+                python3 -c "
+              import sys,json
+              d=json.load(sys.stdin)
+              print(sum(1 for m in d.get('matches',[]) if m.get('vulnerability',{}).get('severity','')=='Critical'))
+              " 2>/dev/null || echo "0")
+              
+              echo "Critical CVEs: $CRIT"
+              [ "$CRIT" -gt 5 ] && echo "WARNING: $CRIT critical CVEs found"
+            displayName: Grype SCA scan
+
+  - stage: DynamicTest
+    displayName: DAST – Dynamic Testing
+    dependsOn:
+      - SecretsAndSAST
+      - SCA
+    jobs:
+      - job: ZAPScan
+        timeoutInMinutes: 20
+        steps:
+          - bash: mkdir -p $(Agent.TempDirectory)/zap
+            displayName: Setup
+
+          - bash: |
+              docker run --rm \
+                -v $(Agent.TempDirectory)/zap:/zap/wrk/:rw \
+                ghcr.io/zaproxy/zaproxy:stable \
+                zap-baseline.py \
+                  -t $(targetUrl) \
+                  -r zap-report.html \
+                  -I 2>&1 || true
+            displayName: ZAP baseline DAST
+            continueOnError: true
+
+          - task: PublishPipelineArtifact@1
+            condition: always()
+            inputs:
+              targetPath: $(Agent.TempDirectory)/zap
+              artifact: zap-report
+
+  - stage: SecurityGate
+    displayName: Security Gate Decision
+    dependsOn:
+      - SecretsAndSAST
+      - SCA
+      - DynamicTest
+    condition: always()
+    jobs:
+      - job: GateDecision
+        steps:
+          - bash: |
+              echo "=== Security Scan Summary ==="
+              echo "Secrets Scan  : ${{ stageDependencies.SecretsAndSAST.SecretsDetection.result }}"
+              echo "SAST          : ${{ stageDependencies.SecretsAndSAST.SemgrepSAST.result }}"
+              echo "SCA           : ${{ stageDependencies.SCA.DepScan.result }}"
+              echo "DAST          : ${{ stageDependencies.DynamicTest.ZAPScan.result }}"
+              
+              GATE_PASS=true
+              [ "${{ stageDependencies.SecretsAndSAST.SecretsDetection.result }}" != "Succeeded" ] && GATE_PASS=false
+              
+              if [ "$GATE_PASS" = "true" ]; then
+                echo "Security gate: PASSED"
+              else
+                echo "Security gate: FAILED"
+                exit 1
+              fi
+            displayName: Evaluate security gate

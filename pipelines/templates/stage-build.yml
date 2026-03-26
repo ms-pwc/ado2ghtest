@@ -1,0 +1,30 @@
+# ============================================================
+# Stage Template: templates/stage-build.yml
+# Concepts: stage template, parameters passed into jobs/steps
+# ============================================================
+
+parameters:
+  - name: buildConfig
+    type: string
+    default: Release
+
+  - name: pool
+    type: string
+    default: ubuntu-latest
+
+stages:
+  - stage: Build
+    displayName: Build (${{ parameters.buildConfig }})
+    jobs:
+      - job: BuildJob
+        displayName: Build & Test
+        pool:
+          vmImage: ${{ parameters.pool }}
+        steps:
+          - checkout: self
+
+          # Reuse the steps template from the same templates folder
+          - template: steps-build.yml
+            parameters:
+              buildConfig: ${{ parameters.buildConfig }}
+              runTests: true

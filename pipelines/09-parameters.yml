@@ -1,0 +1,126 @@
+# ============================================================
+# Pipeline 09: Runtime Parameters
+# Concepts: parameters block, all parameter types (string,
+#           boolean, number, object, stepList, jobList,
+#           stageList), displayName, allowed values,
+#           default values, conditional logic on parameters
+# ============================================================
+
+# Parameters are evaluated at queue time (before the pipeline runs)
+# They are accessed with ${{ parameters.name }} (compile-time)
+parameters:
+
+  # ── String parameter with allowed values (dropdown in UI) ─────
+  - name: environment
+    displayName: Target Environment
+    type: string
+    default: staging
+    values:
+      - dev
+      - staging
+      - production
+
+  # ── Boolean parameter (checkbox in UI) ─────────────────────
+  - name: runIntegrationTests
+    displayName: Run Integration Tests?
+    type: boolean
+    default: true
+
+  # ── Number parameter ────────────────────────────────────────
+  - name: parallelJobs
+    displayName: Number of Parallel Test Jobs
+    type: number
+    default: 2
+
+  # ── String without restriction ──────────────────────────────
+  - name: appVersion
+    displayName: Application Version Tag
+    type: string
+    default: latest
+
+  # ── Object parameter (YAML map) ─────────────────────────────
+  - name: deployConfig
+    displayName: Deployment Configuration
+    type: object
+    default:
+      region: eastus
+      sku: B1
+      instances: 2
+
+  # ── stepList parameter (inject custom steps from caller) ─────
+  - name: postDeploySteps
+    displayName: Post-deploy custom steps
+    type: stepList
+    default: []
+
+trigger:
+  branches:
+    include:
+      - main
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  # ── Stage 1: Build – always runs ─────────────────────────────
+  - stage: Build
+    displayName: Build (version ${{ parameters.appVersion }})
+    jobs:
+      - job: BuildJob
+        steps:
+          - checkout: self
+          - script: |
+              echo "Building version: ${{ parameters.appVersion }}"
+              echo "Target env     : ${{ parameters.environment }}"
+            displayName: Print parameters
+
+          # Compile-time conditional: only add step if boolean is true
+          - ${{ if eq(parameters.runIntegrationTests, true) }}:
+            - script: echo "Integration test step INCLUDED in this build"
+              displayName: Prep for integration tests
+
+  # ── Stage 2: Test – parallel jobs driven by number param ─────
+  - stage: Test
+    displayName: Test (${{ parameters.parallelJobs }} parallel jobs)
+    dependsOn: Build
+    jobs:
+      - job: RunTests
+        displayName: Test job
+        strategy:
+          parallel: ${{ parameters.parallelJobs }}   # use number param
+        steps:
+          - script: echo "Running test slice $(System.JobPositionInPhase) of $(System.TotalJobsInPhase)"
+            displayName: Run test slice
+
+      # Conditional job: only when integration tests requested
+      - ${{ if eq(parameters.runIntegrationTests, true) }}:
+        - job: IntegrationTests
+          displayName: Integration Tests
+          dependsOn: RunTests
+          steps:
+            - script: echo "Running integration tests against ${{ parameters.environment }}"
+              displayName: Integration tests
+
+  # ── Stage 3: Deploy – uses object param ───────────────────────
+  - stage: Deploy
+    displayName: Deploy to ${{ parameters.environment }}
+    dependsOn: Test
+    condition: |
+      and(
+        succeeded(),
+        ne('${{ parameters.environment }}', 'dev')
+      )
+    jobs:
+      - job: DeployJob
+        steps:
+          - script: |
+              echo "Deploying to: ${{ parameters.environment }}"
+              echo "Region      : ${{ parameters.deployConfig.region }}"
+              echo "SKU         : ${{ parameters.deployConfig.sku }}"
+              echo "Instances   : ${{ parameters.deployConfig.instances }}"
+            displayName: Deploy with config
+
+          # Inject caller-supplied post-deploy steps
+          - ${{ each step in parameters.postDeploySteps }}:
+            - ${{ step }}

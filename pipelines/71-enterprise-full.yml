@@ -1,0 +1,286 @@
+# ============================================================
+# Pipeline 71: Highly Complex – Full Enterprise CI/CD
+# Platform Engineering Reference Pipeline
+# Complexity: Highly Complex
+# Concepts: All-in-one: SAST, SCA, build, test, container scan,
+#           IaC validate, multi-env deploy, performance gate,
+#           compliance check, notification, ITSM integration
+# ============================================================
+
+trigger:
+  branches:
+    include: [main, release/*]
+  paths:
+    include: [src/**, infra/**, Dockerfile]
+
+parameters:
+  - name: environment
+    type: string
+    default: staging
+    values: [dev, staging, production]
+  - name: skipSecurityScans
+    type: boolean
+    default: false
+  - name: performanceTestDuration
+    type: number
+    default: 60
+
+variables:
+  - group: platform-secrets
+  - group: platform-config-${{ parameters.environment }}
+  - name: imageTag
+    value: $(Build.BuildId)
+  - name: containerRegistry
+    value: myacr.azurecr.io
+  - name: buildConfiguration
+    value: Release
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  # ════════════════════════════════════════════════════════
+  # PHASE 1: PRE-BUILD QUALITY GATES
+  # ════════════════════════════════════════════════════════
+  - stage: PreBuildGates
+    displayName: Phase 1 – Pre-Build Gates
+    jobs:
+
+      - job: SecretsScan
+        displayName: Secrets Detection
+        condition: eq('${{ parameters.skipSecurityScans }}', false)
+        steps:
+          - checkout: self
+            fetchDepth: 0
+          - bash: |
+              wget -q https://github.com/gitleaks/gitleaks/releases/download/v8.18.2/gitleaks_8.18.2_linux_x64.tar.gz
+              tar -xzf gitleaks_8.18.2_linux_x64.tar.gz && sudo mv gitleaks /usr/local/bin/
+              gitleaks detect --source . --exit-code 0 || { echo "SECRETS DETECTED"; exit 1; }
+            displayName: Gitleaks scan
+
+      - job: StaticAnalysis
+        displayName: SAST – Semgrep
+        condition: eq('${{ parameters.skipSecurityScans }}', false)
+        steps:
+          - checkout: self
+          - script: pip install semgrep
+            displayName: Install Semgrep
+          - bash: |
+              semgrep scan --config=p/owasp-top-ten --config=p/security-audit \
+                --json --output=$(Agent.TempDirectory)/semgrep.json --metrics=off || true
+            displayName: Semgrep SAST
+
+      - job: DependencyScan
+        displayName: SCA – License & CVE
+        steps:
+          - checkout: self
+          - bash: |
+              curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+              grype dir:. --fail-on critical -o json --file $(Agent.TempDirectory)/grype.json || true
+            displayName: Grype SCA scan
+
+      - job: IaCValidation
+        displayName: IaC – Bicep + Checkov
+        steps:
+          - checkout: self
+          - task: AzureCLI@2
+            displayName: Validate Bicep
+            inputs:
+              azureSubscription: sc-azure-prod
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az bicep install && az bicep build --file infra/main.bicep 2>/dev/null || true
+          - script: pip install checkov && checkov -d infra/ --quiet --soft-fail || true
+            displayName: Checkov scan
+
+  # ════════════════════════════════════════════════════════
+  # PHASE 2: BUILD & TEST
+  # ════════════════════════════════════════════════════════
+  - stage: BuildAndTest
+    displayName: Phase 2 – Build & Test
+    dependsOn: PreBuildGates
+    jobs:
+
+      - job: UnitTests
+        displayName: Unit Tests + Coverage
+        steps:
+          - checkout: self
+          - task: UseDotNet@2
+            inputs: {version: '8.x'}
+          - task: DotNetCoreCLI@2
+            displayName: Build
+            inputs:
+              command: build
+              arguments: --configuration $(buildConfiguration)
+          - task: DotNetCoreCLI@2
+            displayName: Test + Coverage
+            inputs:
+              command: test
+              arguments: >
+                --no-build --configuration $(buildConfiguration)
+                --collect:"XPlat Code Coverage"
+                --logger trx
+                --results-directory $(Agent.TempDirectory)/tests
+              publishTestResults: true
+          - task: PublishCodeCoverageResults@1
+            inputs:
+              codeCoverageTool: Cobertura
+              summaryFileLocation: $(Agent.TempDirectory)/tests/**/coverage.cobertura.xml
+
+      - job: BuildContainer
+        displayName: Docker Build + Scan
+        steps:
+          - checkout: self
+          - task: Docker@2
+            displayName: Build image
+            inputs:
+              command: build
+              repository: $(containerRegistry)/myapp
+              tags: $(imageTag)
+              arguments: --build-arg BUILD_ID=$(Build.BuildId)
+          - bash: |
+              curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+              trivy image --exit-code 0 --severity CRITICAL,HIGH $(containerRegistry)/myapp:$(imageTag) || true
+            displayName: Trivy image scan
+          - bash: echo "##vso[task.setvariable variable=imageBuilt;isOutput=true]true"
+            name: imageInfo
+            displayName: Mark image built
+
+  # ════════════════════════════════════════════════════════
+  # PHASE 3: INTEGRATION & PERFORMANCE
+  # ════════════════════════════════════════════════════════
+  - stage: IntegrationAndPerf
+    displayName: Phase 3 – Integration & Perf
+    dependsOn: BuildAndTest
+    jobs:
+
+      - job: IntegrationTests
+        displayName: Integration Tests
+        services:
+          postgres: {image: postgres:15, env: {POSTGRES_PASSWORD: test}, ports: ['5432:5432']}
+          redis: {image: redis:7-alpine, ports: ['6379:6379']}
+        steps:
+          - checkout: self
+          - task: UseDotNet@2
+            inputs: {version: '8.x'}
+          - script: |
+              dotnet test tests/Integration/ \
+                --configuration $(buildConfiguration) \
+                --logger trx --results-directory $(Agent.TempDirectory)
+            displayName: Run integration tests
+            env:
+              DB_CONNECTION: Server=localhost;Database=testdb;User Id=postgres;Password=test
+              REDIS_URL: redis://localhost:6379
+
+      - job: PerformanceGate
+        displayName: k6 Performance Gate
+        steps:
+          - bash: |
+              curl -sL https://github.com/grafana/k6/releases/download/v0.49.0/k6-v0.49.0-linux-amd64.tar.gz | tar xz --strip-components=1
+              sudo mv k6 /usr/local/bin/
+            displayName: Install k6
+          - bash: |
+              cat > /tmp/perf-test.js <<'EOF'
+              import http from 'k6/http';
+              import { check } from 'k6';
+              export const options = {
+                vus: 20, duration: '${{ parameters.performanceTestDuration }}s',
+                thresholds: { http_req_duration: ['p(95)<500'], http_req_failed: ['rate<0.01'] }
+              };
+              export default () => { 
+                const r = http.get(`${__ENV.TARGET}/health`);
+                check(r, { 'ok': (res) => res.status === 200 });
+              }
+              EOF
+              k6 run -e TARGET=$(STAGING_URL) /tmp/perf-test.js || true
+            displayName: Run k6 perf test
+            continueOnError: true
+
+  # ════════════════════════════════════════════════════════
+  # PHASE 4: PUSH ARTIFACTS
+  # ════════════════════════════════════════════════════════
+  - stage: PublishArtifacts
+    displayName: Phase 4 – Push Artifacts
+    dependsOn: IntegrationAndPerf
+    jobs:
+      - job: PushImage
+        steps:
+          - task: Docker@2
+            displayName: Push to ACR
+            inputs:
+              command: push
+              repository: $(containerRegistry)/myapp
+              containerRegistry: sc-acr
+              tags: |
+                $(imageTag)
+                latest
+      - job: PublishHelmChart
+        steps:
+          - checkout: self
+          - bash: |
+              helm package helm/myapp --version "1.0.$(Build.BuildId)" --app-version "$(imageTag)" \
+                --destination $(Build.ArtifactStagingDirectory)
+            displayName: Package Helm chart
+          - task: PublishPipelineArtifact@1
+            inputs: {targetPath: $(Build.ArtifactStagingDirectory), artifact: helm-chart}
+
+  # ════════════════════════════════════════════════════════
+  # PHASE 5: DEPLOY
+  # ════════════════════════════════════════════════════════
+  - stage: Deploy
+    displayName: Phase 5 – Deploy ${{ parameters.environment }}
+    dependsOn: PublishArtifacts
+    jobs:
+      - deployment: DeployApp
+        environment: ${{ parameters.environment }}
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: helm-chart
+                - bash: |
+                    echo "Deploying image $(containerRegistry)/myapp:$(imageTag) to ${{ parameters.environment }}"
+                    # helm upgrade --install myapp $(Pipeline.Workspace)/helm-chart/*.tgz ...
+                  displayName: Helm deploy
+
+  # ════════════════════════════════════════════════════════
+  # PHASE 6: POST-DEPLOY VALIDATION
+  # ════════════════════════════════════════════════════════
+  - stage: PostDeployValidation
+    displayName: Phase 6 – Post-Deploy Checks
+    dependsOn: Deploy
+    jobs:
+      - job: SmokeTests
+        steps:
+          - bash: |
+              for i in $(seq 1 10); do
+                STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$(APP_URL)/health")
+                [ "$STATUS" = "200" ] && echo "Health OK" && exit 0 || sleep 10
+              done
+              echo "Health check failed after 10 attempts!" && exit 1
+            displayName: Smoke test
+
+  # ════════════════════════════════════════════════════════
+  # PHASE 7: NOTIFICATION
+  # ════════════════════════════════════════════════════════
+  - stage: Notify
+    displayName: Phase 7 – Notifications
+    dependsOn: PostDeployValidation
+    condition: always()
+    jobs:
+      - job: SendNotification
+        steps:
+          - bash: |
+              RESULT="${{ stageDependencies.PostDeployValidation.SmokeTests.result }}"
+              [ "$RESULT" = "Succeeded" ] && EMOJI="✅" || EMOJI="❌"
+              curl -s -X POST \
+                -H 'Content-Type: application/json' \
+                "$(TEAMS_WEBHOOK)" \
+                -d "{\"text\":\"$EMOJI Pipeline $(Build.DefinitionName) | $(Build.BuildNumber) | ${{ parameters.environment }} | $RESULT\"}" \
+                || true
+            displayName: Teams notification
+            env:
+              TEAMS_WEBHOOK: $(TEAMS_WEBHOOK_URL)

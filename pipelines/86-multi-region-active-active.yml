@@ -1,0 +1,233 @@
+# ============================================================
+# Pipeline 86: Multi-Region Active-Active with Azure Front Door
+# Complexity: Highly Complex
+# Concepts: Parallel multi-region deployment, Azure Front Door
+#           origin health checks, weight management, WAF policy,
+#           region-aware traffic routing, failover simulation,
+#           geo-distribution validation
+# ============================================================
+
+trigger:
+  branches:
+    include: [main]
+
+parameters:
+  - name: regions
+    type: object
+    default:
+      - name: eastus
+        shortName: eus
+        weight: 40
+        priority: 1
+      - name: westeurope
+        shortName: weu
+        weight: 35
+        priority: 1
+      - name: southeastasia
+        shortName: sea
+        weight: 25
+        priority: 1
+  - name: environment
+    type: string
+    default: prod
+    values: [staging, prod]
+  - name: zeroDowntimeMode
+    type: boolean
+    default: true
+
+variables:
+  - group: multiregion-${{ parameters.environment }}-vars
+  - name: imageTag
+    value: $(Build.BuildId)
+  - name: afdProfileName
+    value: afd-$(appName)-${{ parameters.environment }}
+  - name: afdEndpointName
+    value: $(appName)-${{ parameters.environment }}
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: Build
+    displayName: Build & Push to Global Registry
+    jobs:
+      - job: Build
+        steps:
+          - checkout: self
+          - task: Docker@2
+            displayName: Build & push to ACR (geo-replicated)
+            inputs:
+              command: buildAndPush
+              repository: $(acrName).azurecr.io/$(appName)
+              containerRegistry: sc-acr
+              tags: $(imageTag)
+
+  - stage: ValidateAllRegions
+    displayName: Validate IaC in All Regions (Parallel)
+    dependsOn: Build
+    jobs:
+      - ${{ each region in parameters.regions }}:
+        - job: Validate_${{ region.shortName }}
+          displayName: Validate ${{ region.name }}
+          steps:
+            - checkout: self
+            - task: AzureCLI@2
+              displayName: Bicep what-if (${{ region.name }})
+              inputs:
+                azureSubscription: sc-azure-${{ parameters.environment }}
+                scriptType: bash
+                scriptLocation: inlineScript
+                inlineScript: |
+                  az deployment group what-if \
+                    --resource-group rg-$(appName)-${{ region.shortName }}-${{ parameters.environment }} \
+                    --template-file infra/region.bicep \
+                    --parameters \
+                      region=${{ region.name }} \
+                      imageTag=$(imageTag) \
+                      environment=${{ parameters.environment }}
+
+  # Rolling deployment: reduce origin weight before deploying to it
+  - ${{ each region in parameters.regions }}:
+    - stage: Deploy_${{ region.shortName }}
+      displayName: Deploy to ${{ region.name }}
+      dependsOn:
+        - ValidateAllRegions
+        - ${{ if gt(variables['System.StageAttempt'], 1) }}:
+          - Deploy_${{ parameters.regions[0].shortName }}  # sequential fallback
+      condition: succeeded('ValidateAllRegions')
+      jobs:
+        - deployment: RegionDeploy_${{ region.shortName }}
+          environment: ${{ parameters.environment }}-${{ region.shortName }}
+          strategy:
+            runOnce:
+              preDeploy:
+                steps:
+                  - task: AzureCLI@2
+                    displayName: Drain ${{ region.name }} traffic (zero-downtime)
+                    condition: eq('${{ parameters.zeroDowntimeMode }}', 'true')
+                    inputs:
+                      azureSubscription: sc-azure-${{ parameters.environment }}
+                      scriptType: bash
+                      scriptLocation: inlineScript
+                      inlineScript: |
+                        echo "Setting ${{ region.name }} origin weight to 0 (draining)"
+                        az afd origin update \
+                          --resource-group rg-global \
+                          --profile-name $(afdProfileName) \
+                          --origin-group-name $(appName)-origins \
+                          --origin-name origin-${{ region.shortName }} \
+                          --weight 0
+                        sleep 30   # Let connections drain
+              deploy:
+                steps:
+                  - checkout: self
+                  - task: AzureCLI@2
+                    displayName: Deploy to ${{ region.name }}
+                    inputs:
+                      azureSubscription: sc-azure-${{ parameters.environment }}
+                      scriptType: bash
+                      scriptLocation: inlineScript
+                      inlineScript: |
+                        az deployment group create \
+                          --resource-group rg-$(appName)-${{ region.shortName }}-${{ parameters.environment }} \
+                          --template-file infra/region.bicep \
+                          --parameters \
+                            region=${{ region.name }} \
+                            imageTag=$(imageTag) \
+                            environment=${{ parameters.environment }}
+
+                  - bash: |
+                      REGION_URL="https://$(appName)-${{ region.shortName }}-${{ parameters.environment }}.azurecontainerapps.io"
+                      for i in $(seq 1 10); do
+                        STATUS=$(curl -sf -o /dev/null -w "%{http_code}" "$REGION_URL/health" || echo "000")
+                        echo "Attempt $i: HTTP $STATUS"
+                        [ "$STATUS" = "200" ] && break
+                        sleep 15
+                      done
+                      [ "$STATUS" = "200" ] || exit 1
+                    displayName: Health check ${{ region.name }}
+
+              on:
+                success:
+                  steps:
+                    - task: AzureCLI@2
+                      displayName: Restore ${{ region.name }} traffic
+                      condition: eq('${{ parameters.zeroDowntimeMode }}', 'true')
+                      inputs:
+                        azureSubscription: sc-azure-${{ parameters.environment }}
+                        scriptType: bash
+                        scriptLocation: inlineScript
+                        inlineScript: |
+                          az afd origin update \
+                            --resource-group rg-global \
+                            --profile-name $(afdProfileName) \
+                            --origin-group-name $(appName)-origins \
+                            --origin-name origin-${{ region.shortName }} \
+                            --weight ${{ region.weight }}
+                          echo "${{ region.name }} back online with weight ${{ region.weight }}"
+                failure:
+                  steps:
+                    - task: AzureCLI@2
+                      displayName: Keep ${{ region.name }} drained on failure
+                      inputs:
+                        azureSubscription: sc-azure-${{ parameters.environment }}
+                        scriptType: bash
+                        scriptLocation: inlineScript
+                        inlineScript: |
+                          echo "##vso[task.logissue type=error]${{ region.name }} deploy failed – origin remains drained"
+
+  - stage: FrontDoorValidation
+    displayName: Validate Front Door Global Routing
+    dependsOn:
+      - ${{ each region in parameters.regions }}:
+        - Deploy_${{ region.shortName }}
+    condition: succeeded()
+    jobs:
+      - job: GlobalHealthCheck
+        steps:
+          - task: AzureCLI@2
+            displayName: Check all AFD origins
+            inputs:
+              azureSubscription: sc-azure-${{ parameters.environment }}
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                echo "=== AFD Origin Status ==="
+                az afd origin list \
+                  --resource-group rg-global \
+                  --profile-name $(afdProfileName) \
+                  --origin-group-name $(appName)-origins \
+                  --query "[].{name:name,weight:weight,priority:priority,health:enabledState}" \
+                  -o table
+
+                echo ""
+                echo "=== Global AFD Endpoint ==="
+                AFD_HOSTNAME=$(az afd endpoint show \
+                  --resource-group rg-global \
+                  --profile-name $(afdProfileName) \
+                  --endpoint-name $(afdEndpointName) \
+                  --query hostName -o tsv)
+                echo "Endpoint: https://$AFD_HOSTNAME"
+
+                # Test global endpoint
+                STATUS=$(curl -sf -o /dev/null -w "%{http_code}" "https://$AFD_HOSTNAME/health")
+                echo "Global health: HTTP $STATUS"
+                [ "$STATUS" = "200" ] || { echo "##vso[task.logissue type=error]Global AFD health check failed!"; exit 1; }
+
+          - task: AzureCLI@2
+            displayName: Verify WAF policy mode
+            inputs:
+              azureSubscription: sc-azure-${{ parameters.environment }}
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                MODE=$(az afd waf-policy show \
+                  --resource-group rg-global \
+                  --policy-name $(wafPolicyName) \
+                  --query policySettings.mode -o tsv)
+                echo "WAF mode: $MODE"
+                if [ "$MODE" != "Prevention" ] && [ "${{ parameters.environment }}" = "prod" ]; then
+                  echo "##vso[task.logissue type=error]WAF is not in Prevention mode on production!"
+                  exit 1
+                fi

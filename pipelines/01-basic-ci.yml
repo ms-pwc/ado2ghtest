@@ -1,0 +1,61 @@
+# ============================================================
+# Pipeline 01: Basic CI Pipeline
+# Concepts: trigger, pool, steps, script, checkout, displayName
+# ============================================================
+
+# Trigger on pushes to main and develop branches
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+
+# Do NOT trigger on pull requests (disable PR trigger)
+pr: none
+
+# Agent pool – Microsoft-hosted Ubuntu agent
+pool:
+  vmImage: ubuntu-latest
+
+# A flat list of steps (no explicit jobs/stages = single default job)
+steps:
+  # Checkout source code (default depth = 1)
+  - checkout: self
+    displayName: Checkout source code
+    clean: true            # wipe the workspace before checkout
+    fetchDepth: 1          # shallow clone
+
+  # Inline Bash script step
+  - script: |
+      echo "Hello from Azure Pipelines!"
+      echo "Build ID   : $(Build.BuildId)"
+      echo "Branch     : $(Build.SourceBranchName)"
+      echo "Commit SHA : $(Build.SourceVersion)"
+    displayName: Print build info
+
+  # Install Node.js (task shorthand)
+  - task: NodeTool@0
+    displayName: Install Node.js 20
+    inputs:
+      versionSpec: '20.x'
+
+  # Run npm commands
+  - script: |
+      node --version
+      npm --version
+      npm ci
+    displayName: Install dependencies
+    workingDirectory: $(System.DefaultWorkingDirectory)
+
+  # Run tests
+  - script: npm test -- --ci
+    displayName: Run unit tests
+
+  # Publish test results (JUnit XML)
+  - task: PublishTestResults@2
+    displayName: Publish test results
+    condition: succeededOrFailed()   # always publish even if tests fail
+    inputs:
+      testResultsFormat: JUnit
+      testResultsFiles: '**/test-results.xml'
+      mergeTestResults: true

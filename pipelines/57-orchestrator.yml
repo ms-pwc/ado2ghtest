@@ -1,0 +1,132 @@
+# ============================================================
+# Pipeline 57: Pipeline Orchestrator – Triggers 5 Downstream
+# Complexity: Complex
+# Concepts: pipeline resources with trigger, REST API pipeline
+#           trigger, conditional downstream invocation,
+#           ADO REST API to queue builds programmatically
+# ============================================================
+
+trigger:
+  branches:
+    include: [main]
+
+variables:
+  azureDevOpsOrg: myorg
+  azureDevOpsProject: MyProject
+  adoPat: $(ADO_PAT)          # PAT stored as secret variable
+  imageTag: $(Build.BuildId)
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: PrepareOrchestration
+    displayName: Orchestrate Downstream Pipelines
+    jobs:
+      - job: TriggerDownstream
+        steps:
+          - checkout: self
+
+          # Helper function to trigger a pipeline by definition ID
+          - bash: |
+              trigger_pipeline() {
+                DEF_ID=$1
+                NAME=$2
+                PARAMS=$3
+                
+                echo "Triggering pipeline: $NAME (Definition ID: $DEF_ID)"
+                
+                RESPONSE=$(curl -s -X POST \
+                  -H "Content-Type: application/json" \
+                  -H "Authorization: Basic $(echo -n :$(ADO_PAT) | base64)" \
+                  "https://dev.azure.com/$(azureDevOpsOrg)/$(azureDevOpsProject)/_apis/build/builds?api-version=7.1" \
+                  -d "{
+                    \"definition\": {\"id\": $DEF_ID},
+                    \"sourceBranch\": \"$(Build.SourceBranch)\",
+                    \"sourceVersion\": \"$(Build.SourceVersion)\",
+                    \"parameters\": \"$PARAMS\",
+                    \"triggerInfo\": {
+                      \"ci.message\": \"Triggered by orchestrator $(Build.BuildId)\"
+                    }
+                  }")
+                
+                BUILD_ID=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])" 2>/dev/null)
+                echo "Triggered $NAME → Build ID: $BUILD_ID"
+                echo "$BUILD_ID"
+              }
+              
+              # Trigger 5 downstream pipelines in parallel
+              INFRA_ID=$(trigger_pipeline 101 "Infrastructure-Deploy" \
+                "{\"imageTag\":\"$(imageTag)\"}")
+              
+              API_ID=$(trigger_pipeline 102 "API-Deploy" \
+                "{\"imageTag\":\"$(imageTag)\",\"environment\":\"staging\"}")
+              
+              FRONTEND_ID=$(trigger_pipeline 103 "Frontend-Deploy" \
+                "{\"imageTag\":\"$(imageTag)\"}")
+              
+              DOCS_ID=$(trigger_pipeline 104 "Docs-Publish" "")
+              
+              NOTIFY_ID=$(trigger_pipeline 105 "Release-Notify" \
+                "{\"version\":\"$(semVer)\",\"buildId\":\"$(imageTag)\"}")
+              
+              echo "All downstream pipelines triggered:"
+              echo "  Infrastructure : Build $INFRA_ID"
+              echo "  API Deploy     : Build $API_ID"
+              echo "  Frontend       : Build $FRONTEND_ID"
+              echo "  Docs           : Build $DOCS_ID"
+              echo "  Notification   : Build $NOTIFY_ID"
+              
+              # Store IDs for polling
+              echo "##vso[task.setvariable variable=infraBuildId]$INFRA_ID"
+              echo "##vso[task.setvariable variable=apiBuildId]$API_ID"
+            displayName: Trigger 5 downstream pipelines
+            env:
+              ADO_PAT: $(adoPat)
+
+          # Poll until all downstream builds complete
+          - bash: |
+              poll_build() {
+                BUILD_ID=$1
+                NAME=$2
+                MAX_WAIT=1800    # 30 minutes
+                ELAPSED=0
+                
+                while [ $ELAPSED -lt $MAX_WAIT ]; do
+                  STATUS=$(curl -s \
+                    -H "Authorization: Basic $(echo -n :$(ADO_PAT) | base64)" \
+                    "https://dev.azure.com/$(azureDevOpsOrg)/$(azureDevOpsProject)/_apis/build/builds/$BUILD_ID?api-version=7.1" \
+                    | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['status'],'/',d.get('result',''))" \
+                    2>/dev/null || echo "unknown / unknown")
+                  
+                  echo "[$NAME] Status: $STATUS (${ELAPSED}s elapsed)"
+                  
+                  echo "$STATUS" | grep -qE "completed" && break
+                  sleep 30
+                  ELAPSED=$((ELAPSED + 30))
+                done
+                
+                RESULT=$(curl -s \
+                  -H "Authorization: Basic $(echo -n :$(ADO_PAT) | base64)" \
+                  "https://dev.azure.com/$(azureDevOpsOrg)/$(azureDevOpsProject)/_apis/build/builds/$BUILD_ID?api-version=7.1" \
+                  | python3 -c "import sys,json; print(json.load(sys.stdin).get('result','unknown'))" \
+                  2>/dev/null)
+                
+                echo "[$NAME] Final result: $RESULT"
+                [ "$RESULT" = "succeeded" ]
+              }
+              
+              # Poll infrastructure and API builds
+              poll_build $(infraBuildId) "Infrastructure" &
+              INFRA_PID=$!
+              
+              poll_build $(apiBuildId) "API-Deploy" &
+              API_PID=$!
+              
+              wait $INFRA_PID && echo "Infrastructure: OK" || echo "Infrastructure: FAILED"
+              wait $API_PID   && echo "API Deploy: OK"     || echo "API Deploy: FAILED"
+            displayName: Poll downstream build completion
+            timeoutInMinutes: 35
+            env:
+              ADO_PAT: $(adoPat)

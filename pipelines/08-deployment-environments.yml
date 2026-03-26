@@ -1,0 +1,132 @@
+# ============================================================
+# Pipeline 08: Deployment Jobs & Environments
+# Concepts: deployment job, environment, strategy (runOnce /
+#           rolling / canary), approvals & checks (configured
+#           in the ADO UI on the environment), lifecycleHooks
+#           (preDeploy, deploy, routeTraffic, postRouteTraffic,
+#           on.failure, on.success)
+# ============================================================
+
+trigger:
+  branches:
+    include:
+      - main
+
+variables:
+  buildArtifact: webapp-drop
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  # ── Stage 1: Build ───────────────────────────────────────────
+  - stage: Build
+    jobs:
+      - job: BuildApp
+        steps:
+          - checkout: self
+          - script: echo "Building app..."
+            displayName: Build
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: $(Build.ArtifactStagingDirectory)
+              artifact: $(buildArtifact)
+
+  # ── Stage 2: Deploy to DEV – runOnce strategy ────────────────
+  - stage: DeployDev
+    displayName: Deploy to DEV
+    dependsOn: Build
+    jobs:
+      - deployment: DeployWebApp
+        displayName: Deploy web app to DEV
+        environment: dev          # environment must exist in ADO project
+        strategy:
+          runOnce:                # simplest strategy – deploy once
+            deploy:
+              steps:
+                - download: current
+                  artifact: $(buildArtifact)
+                - script: echo "Deploying to DEV environment..."
+                  displayName: Deploy to DEV
+
+  # ── Stage 3: Deploy to STAGING – rolling strategy ────────────
+  - stage: DeployStaging
+    displayName: Deploy to Staging (Rolling)
+    dependsOn: DeployDev
+    jobs:
+      - deployment: StagingRolling
+        displayName: Rolling deploy to Staging
+        environment: staging
+        strategy:
+          rolling:
+            maxParallel: 2        # deploy to 2 targets at a time
+            preDeploy:            # lifecycle hook: runs before deploy
+              steps:
+                - script: echo "Pre-deploy health check on $(Strategy.CycleName)"
+                  displayName: Pre-deploy check
+            deploy:
+              steps:
+                - download: current
+                  artifact: $(buildArtifact)
+                - script: echo "Rolling deploy to $(Strategy.CycleName)"
+                  displayName: Rolling deploy step
+            routeTraffic:         # lifecycle hook: route traffic gradually
+              steps:
+                - script: echo "Routing traffic to new version..."
+                  displayName: Route traffic
+            postRouteTraffic:     # lifecycle hook: post-traffic checks
+              steps:
+                - script: echo "Post-route health check..."
+                  displayName: Post-route check
+            on:
+              failure:            # lifecycle hook: on failure
+                steps:
+                  - script: echo "Rolling deploy failed – triggering rollback"
+                    displayName: Rollback
+              success:            # lifecycle hook: on success
+                steps:
+                  - script: echo "Rolling deploy succeeded!"
+                    displayName: Success notification
+
+  # ── Stage 4: Deploy to PROD – canary strategy ────────────────
+  - stage: DeployProd
+    displayName: Deploy to Production (Canary)
+    dependsOn: DeployStaging
+    # Approval gates are configured on the 'production' environment
+    # in the ADO UI (Settings > Approvals and checks)
+    jobs:
+      - deployment: ProdCanary
+        displayName: Canary deploy to Production
+        environment: production
+        strategy:
+          canary:
+            increments: [25, 50, 100]   # traffic % increments
+            preDeploy:
+              steps:
+                - script: echo "Pre-deploy validation before canary..."
+                  displayName: Pre-deploy validation
+            deploy:
+              steps:
+                - download: current
+                  artifact: $(buildArtifact)
+                - script: |
+                    echo "Canary deploy at $(Strategy.CycleNumber)% → increment $(Strategy.CycleName)"
+                  displayName: Canary deploy
+            routeTraffic:
+              steps:
+                - script: echo "Routing $(Strategy.CycleName)% of traffic to canary"
+                  displayName: Shift traffic
+            postRouteTraffic:
+              steps:
+                - script: echo "Monitoring canary at $(Strategy.CycleName)%..."
+                  displayName: Monitor canary
+            on:
+              failure:
+                steps:
+                  - script: echo "Canary failed at $(Strategy.CycleName)% – rolling back"
+                    displayName: Canary rollback
+              success:
+                steps:
+                  - script: echo "Production canary complete – 100% traffic shifted"
+                    displayName: Canary complete

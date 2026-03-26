@@ -1,0 +1,247 @@
+# ============================================================
+# Pipeline 82: Kubernetes Operator & CRD Lifecycle
+# Complexity: Highly Complex
+# Concepts: Operator SDK build, CRD install/upgrade,
+#           controller deployment, RBAC (ClusterRole/Binding),
+#           webhook cert management, operand creation tests,
+#           operator e2e validation, safe CRD migration
+# ============================================================
+
+trigger:
+  branches:
+    include: [main]
+  paths:
+    include: [operator/**, config/crd/**, config/rbac/**]
+
+parameters:
+  - name: environment
+    type: string
+    default: staging
+    values: [dev, staging, prod]
+  - name: operatorVersion
+    type: string
+    default: $(Build.BuildId)
+  - name: runE2ETests
+    type: boolean
+    default: true
+
+variables:
+  - group: k8s-operator-${{ parameters.environment }}
+  - name: operatorImage
+    value: $(acrName).azurecr.io/my-operator
+  - name: operatorNamespace
+    value: my-operator-system
+  - name: testNamespace
+    value: operator-e2e-$(Build.BuildId)
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: Build
+    displayName: Build Operator
+    jobs:
+      - job: BuildOperator
+        steps:
+          - checkout: self
+
+          - bash: |
+              curl -L https://go.dev/dl/go1.22.linux-amd64.tar.gz | sudo tar -C /usr/local -xzf -
+              export PATH=$PATH:/usr/local/go/bin
+              go version
+            displayName: Install Go
+
+          - bash: |
+              export PATH=$PATH:/usr/local/go/bin
+              cd operator
+              go build ./...
+            displayName: Build operator
+
+          - bash: |
+              export PATH=$PATH:/usr/local/go/bin
+              cd operator
+              go test ./... -v --ginkgo.v 2>&1 | tee test-results.txt
+            displayName: Unit tests
+
+          - bash: |
+              export PATH=$PATH:/usr/local/go/bin
+              cd operator
+              go vet ./...
+              curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(go env GOPATH)/bin v1.56.0
+              golangci-lint run
+            displayName: Lint
+
+          - task: Docker@2
+            inputs:
+              command: buildAndPush
+              repository: $(operatorImage)
+              containerRegistry: sc-acr
+              dockerfile: operator/Dockerfile
+              tags: $(operatorVersion)
+
+  - stage: ValidateCRDs
+    displayName: Validate CRD Manifests
+    dependsOn: Build
+    jobs:
+      - job: ValidateCRDs
+        steps:
+          - checkout: self
+
+          - bash: |
+              pip install kubernetes-validate
+              for crd in config/crd/bases/*.yaml; do
+                echo "Validating: $crd"
+                kubernetes-validate "$crd" --version 1.29
+              done
+            displayName: Validate CRD schemas
+
+          - bash: |
+              # Check for CRD version strategy (alpha→beta→stable)
+              for crd in config/crd/bases/*.yaml; do
+                VERSIONS=$(yq '.spec.versions[].name' "$crd")
+                echo "=== $(basename $crd) versions: $VERSIONS"
+                # Ensure stable (v1) version is marked as storage
+                STORAGE=$(yq '.spec.versions[] | select(.storage == true) | .name' "$crd")
+                echo "  Storage version: $STORAGE"
+              done
+            displayName: Check CRD versioning strategy
+
+          - bash: |
+              # Dry-run CRD apply against test cluster
+              kubectl apply --dry-run=server -f config/crd/bases/
+            displayName: Dry-run CRD apply
+            env:
+              KUBECONFIG: $(kubeconfig)
+
+  - stage: DeployCRDs
+    displayName: Install/Upgrade CRDs
+    dependsOn: ValidateCRDs
+    jobs:
+      - deployment: CRDInstall
+        environment: ${{ parameters.environment }}/$(operatorNamespace)
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                # Backup existing CRDs before upgrade
+                - bash: |
+                    kubectl get crds -o yaml > crds-backup-$(date +%Y%m%d%H%M%S).yaml
+                    echo "CRD backup created"
+                  displayName: Backup existing CRDs
+                  env:
+                    KUBECONFIG: $(kubeconfig)
+
+                # Apply CRDs (install/upgrade)
+                - task: Kubernetes@1
+                  displayName: Apply CRDs
+                  inputs:
+                    kubernetesServiceEndpoint: sc-aks-${{ parameters.environment }}
+                    command: apply
+                    arguments: -f config/crd/bases/ --server-side
+
+                # Wait for CRDs to be established
+                - bash: |
+                    for crd in $(kubectl get crds -l app.kubernetes.io/part-of=my-operator -o name); do
+                      kubectl wait "$crd" --for=condition=Established --timeout=60s
+                    done
+                  displayName: Wait for CRDs established
+                  env:
+                    KUBECONFIG: $(kubeconfig)
+
+  - stage: DeployOperator
+    displayName: Deploy Operator Controller
+    dependsOn: DeployCRDs
+    jobs:
+      - deployment: OperatorDeploy
+        environment: ${{ parameters.environment }}/$(operatorNamespace)
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                # Create operator namespace
+                - task: Kubernetes@1
+                  inputs:
+                    kubernetesServiceEndpoint: sc-aks-${{ parameters.environment }}
+                    command: apply
+                    arguments: -f config/namespace.yaml
+
+                # Apply RBAC (SA, ClusterRole, ClusterRoleBinding)
+                - task: Kubernetes@1
+                  displayName: Apply RBAC
+                  inputs:
+                    kubernetesServiceEndpoint: sc-aks-${{ parameters.environment }}
+                    namespace: $(operatorNamespace)
+                    command: apply
+                    arguments: -f config/rbac/
+
+                # Create webhook cert (cert-manager)
+                - task: Kubernetes@1
+                  displayName: Apply webhook certificate
+                  inputs:
+                    kubernetesServiceEndpoint: sc-aks-${{ parameters.environment }}
+                    namespace: $(operatorNamespace)
+                    command: apply
+                    arguments: -f config/certmanager/
+                  continueOnError: true   # cert-manager may not be present in all envs
+
+                # Deploy operator controller
+                - task: KubernetesManifest@1
+                  displayName: Deploy operator
+                  inputs:
+                    action: deploy
+                    kubernetesServiceConnection: sc-aks-${{ parameters.environment }}
+                    namespace: $(operatorNamespace)
+                    manifests: config/manager/manager.yaml
+                    containers: $(operatorImage):$(operatorVersion)
+
+                # Wait for operator to be ready
+                - task: Kubernetes@1
+                  displayName: Wait for operator pod
+                  inputs:
+                    kubernetesServiceEndpoint: sc-aks-${{ parameters.environment }}
+                    namespace: $(operatorNamespace)
+                    command: rollout
+                    arguments: status deployment/controller-manager --timeout=3m
+
+  - stage: E2ETests
+    displayName: Operator E2E Tests
+    dependsOn: DeployOperator
+    condition: and(succeeded(), eq('${{ parameters.runE2ETests }}', 'true'))
+    jobs:
+      - job: OperatorE2E
+        timeoutInMinutes: 30
+        steps:
+          - checkout: self
+
+          - bash: |
+              export PATH=$PATH:/usr/local/go/bin
+              # Create test namespace
+              kubectl create ns $(testNamespace) --dry-run=client -o yaml | kubectl apply -f -
+
+              # Run e2e tests using envtest or against real cluster
+              cd operator
+              go test ./test/e2e/... \
+                -v \
+                --ginkgo.v \
+                -test.timeout 20m 2>&1 | tee e2e-results.txt
+            displayName: Run operator E2E tests
+            env:
+              KUBECONFIG: $(kubeconfig)
+              TEST_NAMESPACE: $(testNamespace)
+
+          - task: PublishTestResults@2
+            condition: always()
+            inputs:
+              testResultsFormat: JUnit
+              testResultsFiles: operator/e2e-*.xml
+
+          - bash: kubectl delete ns $(testNamespace) --ignore-not-found
+            condition: always()
+            displayName: Cleanup test namespace
+            env:
+              KUBECONFIG: $(kubeconfig)

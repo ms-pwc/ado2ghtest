@@ -1,0 +1,15 @@
+# ============================================================
+# Pipeline 13: Hello World – Absolute Minimum Pipeline
+# Complexity: Simple
+# Concepts: minimal trigger, single job, echo step
+# ============================================================
+
+trigger:
+  - main
+
+pool:
+  vmImage: ubuntu-latest
+
+steps:
+  - script: echo "Hello, Azure Pipelines!"
+    displayName: Hello World

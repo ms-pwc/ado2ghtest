@@ -1,0 +1,92 @@
+# ============================================================
+# Pipeline 18: File Operations – Copy, Archive & Extract
+# Complexity: Simple
+# Concepts: CopyFiles, ArchiveFiles, ExtractFiles, DeleteFiles,
+#           glob patterns, overwrite, flattenFolders
+# ============================================================
+
+trigger:
+  - main
+
+pool:
+  vmImage: ubuntu-latest
+
+steps:
+  - checkout: self
+
+  # Create some sample files to work with
+  - bash: |
+      mkdir -p src/app src/lib
+      echo "app code"  > src/app/main.js
+      echo "lib code"  > src/lib/util.js
+      echo "readme"    > README.md
+      echo "config"    > config.json
+    displayName: Create sample files
+
+  # Copy specific files to staging directory
+  - task: CopyFiles@2
+    displayName: Copy JS source files
+    inputs:
+      SourceFolder: src
+      Contents: |
+        **/*.js
+        **/*.ts
+      TargetFolder: $(Build.ArtifactStagingDirectory)/src
+      OverWrite: true
+      flattenFolders: false        # preserve directory structure
+
+  # Copy a single file
+  - task: CopyFiles@2
+    displayName: Copy config
+    inputs:
+      SourceFolder: $(System.DefaultWorkingDirectory)
+      Contents: config.json
+      TargetFolder: $(Build.ArtifactStagingDirectory)
+
+  # Archive the staging directory into a zip
+  - task: ArchiveFiles@2
+    displayName: Create zip archive
+    inputs:
+      rootFolderOrFile: $(Build.ArtifactStagingDirectory)
+      includeRootFolder: false
+      archiveType: zip
+      archiveFile: $(Build.ArtifactStagingDirectory)/release-$(Build.BuildId).zip
+      replaceExistingArchive: true
+
+  # Also create a tar.gz
+  - task: ArchiveFiles@2
+    displayName: Create tar.gz archive
+    inputs:
+      rootFolderOrFile: $(Build.ArtifactStagingDirectory)/src
+      includeRootFolder: true
+      archiveType: tar
+      tarCompression: gz
+      archiveFile: $(Build.ArtifactStagingDirectory)/src-$(Build.BuildId).tar.gz
+
+  # Extract zip to verify it
+  - task: ExtractFiles@1
+    displayName: Extract zip to verify
+    inputs:
+      archiveFilePatterns: $(Build.ArtifactStagingDirectory)/release-$(Build.BuildId).zip
+      destinationFolder: $(Agent.TempDirectory)/extracted
+      cleanDestinationFolder: true
+
+  - bash: |
+      echo "Extracted contents:"
+      find $(Agent.TempDirectory)/extracted -type f
+    displayName: Verify extracted contents
+
+  # Delete unwanted files before publish
+  - task: DeleteFiles@1
+    displayName: Delete intermediate files
+    inputs:
+      SourceFolder: $(Build.ArtifactStagingDirectory)
+      Contents: src/**
+
+  # Publish the final archive
+  - task: PublishBuildArtifacts@1
+    displayName: Publish zip artifact
+    inputs:
+      pathToPublish: $(Build.ArtifactStagingDirectory)
+      artifactName: release
+      publishLocation: Container

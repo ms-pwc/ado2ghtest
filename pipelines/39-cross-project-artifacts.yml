@@ -1,0 +1,87 @@
+# ============================================================
+# Pipeline 39: Cross-Project Artifact Consumption
+# Complexity: Medium
+# Concepts: pipeline resource, build artifacts from another
+#           project, version pinning, resource variables,
+#           Universal Packages from Azure Artifacts
+# ============================================================
+
+trigger:
+  branches:
+    include: [main]
+
+resources:
+  # Consume artifact from a different ADO project pipeline
+  pipelines:
+    - pipeline: coreLibrary
+      source: CoreLibrary-CI
+      project: PlatformTeam           # cross-project reference
+      branch: main
+      version: '$(CORE_LIBRARY_VERSION)'   # pin to specific build or leave blank for latest
+      trigger:
+        branches:
+          include: [main]
+
+  # Another pipeline in same project
+  pipelines:
+    - pipeline: sharedInfra
+      source: SharedInfra-Release
+      trigger: true
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: Build
+    jobs:
+      - job: BuildWithUpstreamArtifacts
+        steps:
+          - checkout: self
+
+          # Download all artifacts from coreLibrary pipeline
+          - download: coreLibrary
+            displayName: Download Core Library artifacts
+
+          # Download specific artifact from sharedInfra
+          - download: sharedInfra
+            artifact: infra-config
+            displayName: Download infra config
+
+          # Print resource variables
+          - bash: |
+              echo "=== Upstream Resource Info ==="
+              echo "coreLibrary runID     : $(resources.pipeline.coreLibrary.runID)"
+              echo "coreLibrary runName   : $(resources.pipeline.coreLibrary.runName)"
+              echo "coreLibrary sourceBranch: $(resources.pipeline.coreLibrary.sourceBranch)"
+              echo "coreLibrary sourceCommit: $(resources.pipeline.coreLibrary.sourceCommit)"
+              echo ""
+              echo "sharedInfra runID     : $(resources.pipeline.sharedInfra.runID)"
+            displayName: Print resource metadata
+
+          # Use downloaded artifacts
+          - bash: |
+              echo "Core Library files:"
+              ls $(Pipeline.Workspace)/coreLibrary/ || echo "(empty)"
+              echo ""
+              echo "Infra config files:"
+              ls $(Pipeline.Workspace)/sharedInfra/infra-config/ || echo "(empty)"
+            displayName: Inspect downloaded artifacts
+
+          # Build using the downloaded library
+          - task: UseDotNet@2
+            inputs:
+              version: '8.x'
+
+          - bash: |
+              # Add the downloaded NuGet packages as a local feed
+              dotnet nuget add source "$(Pipeline.Workspace)/coreLibrary/nuget-packages" \
+                --name local-feed || true
+              dotnet restore
+              dotnet build --configuration Release
+            displayName: Build with upstream library
+
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: $(Build.ArtifactStagingDirectory)
+              artifact: app-artifact

@@ -1,0 +1,270 @@
+# ============================================================
+# Pipeline 81: ML Champion/Challenger Model Swap
+# Complexity: Highly Complex
+# Concepts: Azure ML job comparison, metric-based promotion,
+#           model registry staging→production, endpoint traffic
+#           splitting, A/B test setup, champion/challenger swap,
+#           automated rollback on performance degradation
+# ============================================================
+
+trigger:
+  branches:
+    include: [main]
+  paths:
+    include: [ml/**, src/models/**]
+
+parameters:
+  - name: experimentName
+    type: string
+    default: fraud-detection-v3
+  - name: metricName
+    type: string
+    default: f1_score
+  - name: metricThreshold
+    type: number
+    default: 0.92
+  - name: trafficSplitPct
+    type: number
+    default: 20
+    displayName: 'Challenger traffic %'
+  - name: promotionWaitHours
+    type: number
+    default: 24
+  - name: environment
+    type: string
+    default: prod
+    values: [staging, prod]
+
+variables:
+  - group: azureml-${{ parameters.environment }}-vars
+  - name: workspaceName
+    value: mlw-$(orgName)-${{ parameters.environment }}
+  - name: rgName
+    value: rg-ml-${{ parameters.environment }}
+  - name: endpointName
+    value: fraud-detection-endpoint
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: TrainChallenger
+    displayName: Train Challenger Model
+    jobs:
+      - job: TrainModel
+        timeoutInMinutes: 120
+        steps:
+          - checkout: self
+
+          - bash: |
+              pip install azure-ai-ml azure-identity pandas scikit-learn
+            displayName: Install Azure ML SDK
+
+          - bash: |
+              python ml/train.py \
+                --experiment-name ${{ parameters.experimentName }} \
+                --workspace-name $(workspaceName) \
+                --resource-group $(rgName) \
+                --subscription-id $(subscriptionId) \
+                --output-file run-id.txt
+            displayName: Submit training job
+            env:
+              AZURE_CLIENT_ID: $(spClientId)
+              AZURE_CLIENT_SECRET: $(spClientSecret)
+              AZURE_TENANT_ID: $(tenantId)
+
+          - bash: |
+              python ml/wait_for_run.py \
+                --run-id-file run-id.txt \
+                --timeout-minutes 90
+            displayName: Wait for training to complete
+
+          - bash: |
+              python - <<'PYEOF'
+              from azure.ai.ml import MLClient
+              from azure.identity import ClientSecretCredential
+
+              cred = ClientSecretCredential("$(tenantId)", "$(spClientId)", "$(spClientSecret)")
+              ml_client = MLClient(cred, "$(subscriptionId)", "$(rgName)", "$(workspaceName)")
+
+              with open("run-id.txt") as f:
+                  run_id = f.read().strip()
+
+              run = ml_client.jobs.get(run_id)
+              metrics = run.properties.get("system_metrics", {})
+              metric_value = float(run.outputs.get("$(metricName)", 0))
+
+              print(f"Challenger {$(metricName)}: {metric_value}")
+              print(f"##vso[task.setvariable variable=challengerMetric;isOutput=true]{metric_value}")
+
+              if metric_value < ${{ parameters.metricThreshold }}:
+                  print(f"##vso[task.logissue type=error]Challenger below threshold: {metric_value} < ${{ parameters.metricThreshold }}")
+                  exit(1)
+              PYEOF
+            name: trainMetrics
+            displayName: Extract and compare metrics
+
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: ml/reports
+              artifactName: training-reports
+
+  - stage: RegisterChallenger
+    displayName: Register Challenger Model
+    dependsOn: TrainChallenger
+    jobs:
+      - job: RegisterModel
+        steps:
+          - checkout: self
+          - bash: pip install azure-ai-ml azure-identity
+          - bash: |
+              python ml/register_model.py \
+                --run-id-file run-id.txt \
+                --model-name fraud-detection \
+                --stage Staging \
+                --workspace-name $(workspaceName) \
+                --resource-group $(rgName) \
+                --subscription-id $(subscriptionId)
+              
+              MODEL_VERSION=$(cat model-version.txt)
+              echo "##vso[task.setvariable variable=challengerVersion;isOutput=true]$MODEL_VERSION"
+            name: regModel
+            displayName: Register to Staging
+            env:
+              AZURE_CLIENT_ID: $(spClientId)
+              AZURE_CLIENT_SECRET: $(spClientSecret)
+              AZURE_TENANT_ID: $(tenantId)
+
+  - stage: DeployChallenger
+    displayName: Deploy Challenger (A/B Traffic Split)
+    dependsOn: RegisterChallenger
+    variables:
+      challengerVersion: $[ stageDependencies.RegisterChallenger.RegisterModel.outputs['regModel.challengerVersion'] ]
+    jobs:
+      - deployment: DeployChallengerEndpoint
+        environment: ${{ parameters.environment }}-ml
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - bash: pip install azure-ai-ml azure-identity
+                - bash: |
+                    python - <<'PYEOF'
+                    from azure.ai.ml import MLClient
+                    from azure.ai.ml.entities import ManagedOnlineDeployment, ManagedOnlineEndpoint
+                    from azure.identity import ClientSecretCredential
+                    import os
+
+                    cred = ClientSecretCredential(
+                        os.environ["AZURE_TENANT_ID"],
+                        os.environ["AZURE_CLIENT_ID"],
+                        os.environ["AZURE_CLIENT_SECRET"]
+                    )
+                    ml_client = MLClient(cred, "$(subscriptionId)", "$(rgName)", "$(workspaceName)")
+
+                    # Create challenger deployment
+                    challenger = ManagedOnlineDeployment(
+                        name="challenger-$(Build.BuildId)",
+                        endpoint_name="$(endpointName)",
+                        model=f"azureml:fraud-detection:$(challengerVersion)",
+                        instance_type="Standard_DS2_v2",
+                        instance_count=1,
+                    )
+                    ml_client.online_deployments.begin_create_or_update(challenger).result()
+
+                    # Set traffic split: champion gets (100 - split)%, challenger gets split%
+                    endpoint = ml_client.online_endpoints.get("$(endpointName)")
+                    endpoint.traffic = {
+                        "champion": 100 - ${{ parameters.trafficSplitPct }},
+                        f"challenger-$(Build.BuildId)": ${{ parameters.trafficSplitPct }}
+                    }
+                    ml_client.online_endpoints.begin_create_or_update(endpoint).result()
+                    print("Traffic split configured successfully")
+                    PYEOF
+                  displayName: Deploy with traffic split
+                  env:
+                    AZURE_CLIENT_ID: $(spClientId)
+                    AZURE_CLIENT_SECRET: $(spClientSecret)
+                    AZURE_TENANT_ID: $(tenantId)
+
+  - stage: MonitorAndPromote
+    displayName: Monitor AB Test & Promote Champion
+    dependsOn: DeployChallenger
+    jobs:
+      - job: WaitAndCompare
+        timeoutInMinutes: $[ multiply(${{ parameters.promotionWaitHours }}, 60) ]
+        steps:
+          - bash: |
+              # In real scenario: wait and poll App Insights for live metrics
+              echo "Monitoring A/B test for ${{ parameters.promotionWaitHours }} hours..."
+              echo "Challenger traffic: ${{ parameters.trafficSplitPct }}%"
+              # Simulated wait (replace with actual monitoring loop)
+              sleep 60
+            displayName: Monitor A/B test period
+
+          - bash: pip install azure-ai-ml azure-identity azure-monitor-query
+          - bash: |
+              python ml/compare_models.py \
+                --endpoint $(endpointName) \
+                --challenger-deployment challenger-$(Build.BuildId) \
+                --metric $(metricName) \
+                --threshold ${{ parameters.metricThreshold }} \
+                --output comparison.json
+              cat comparison.json
+            displayName: Compare champion vs challenger
+            env:
+              AZURE_CLIENT_ID: $(spClientId)
+              AZURE_CLIENT_SECRET: $(spClientSecret)
+              AZURE_TENANT_ID: $(tenantId)
+
+          - bash: |
+              WINNER=$(jq -r '.winner' comparison.json)
+              echo "Winner: $WINNER"
+              echo "##vso[task.setvariable variable=winner]$WINNER"
+            displayName: Determine winner
+
+          - bash: |
+              python - <<'PYEOF'
+              from azure.ai.ml import MLClient
+              from azure.identity import ClientSecretCredential
+              import os, json
+
+              with open("comparison.json") as f:
+                  comparison = json.load(f)
+              winner = comparison["winner"]
+              print(f"Promoting {winner} to champion")
+
+              cred = ClientSecretCredential(
+                  os.environ["AZURE_TENANT_ID"],
+                  os.environ["AZURE_CLIENT_ID"],
+                  os.environ["AZURE_CLIENT_SECRET"]
+              )
+              ml_client = MLClient(cred, "$(subscriptionId)", "$(rgName)", "$(workspaceName)")
+
+              if winner == "challenger":
+                  # Challenger wins: route 100% traffic to challenger, rename as champion
+                  endpoint = ml_client.online_endpoints.get("$(endpointName)")
+                  endpoint.traffic = {f"challenger-$(Build.BuildId)": 100}
+                  ml_client.online_endpoints.begin_create_or_update(endpoint).result()
+                  print("Challenger promoted to champion!")
+              else:
+                  # Champion wins: remove challenger deployment
+                  ml_client.online_deployments.begin_delete(
+                      name=f"challenger-$(Build.BuildId)",
+                      endpoint_name="$(endpointName)"
+                  ).result()
+                  print("Champion retained, challenger removed.")
+              PYEOF
+            displayName: Promote winner / remove loser
+            env:
+              AZURE_CLIENT_ID: $(spClientId)
+              AZURE_CLIENT_SECRET: $(spClientSecret)
+              AZURE_TENANT_ID: $(tenantId)
+
+          - task: PublishPipelineArtifact@1
+            condition: always()
+            inputs:
+              targetPath: comparison.json
+              artifactName: model-comparison

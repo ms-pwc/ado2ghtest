@@ -1,0 +1,247 @@
+# ============================================================
+# Pipeline 77: Microservice Mesh with Dapr Sidecar Deploy
+# Complexity: Highly Complex
+# Concepts: Dapr installation, component manifests (state store,
+#           pub/sub, bindings), per-service Dapr app-id annotations,
+#           service invocation tests, resiliency policies, secrets
+# ============================================================
+
+trigger:
+  branches:
+    include: [main]
+  paths:
+    include: [services/**, dapr/**, k8s/**]
+
+parameters:
+  - name: environment
+    type: string
+    default: staging
+    values: [dev, staging, prod]
+  - name: services
+    type: object
+    default:
+      - name: order-service
+        appId: order-svc
+        port: 3000
+        image: order-service
+      - name: payment-service
+        appId: payment-svc
+        port: 3001
+        image: payment-service
+      - name: inventory-service
+        appId: inventory-svc
+        port: 3002
+        image: inventory-service
+      - name: notification-service
+        appId: notification-svc
+        port: 3003
+        image: notification-service
+  - name: daprVersion
+    type: string
+    default: 1.12.4
+
+variables:
+  - group: dapr-mesh-${{ parameters.environment }}
+  - name: registry
+    value: $(acrName).azurecr.io
+  - name: namespace
+    value: microservices-${{ parameters.environment }}
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: BuildServices
+    displayName: Build All Services
+    jobs:
+      - ${{ each svc in parameters.services }}:
+        - job: Build_${{ replace(svc.name, '-', '_') }}
+          displayName: Build ${{ svc.name }}
+          steps:
+            - checkout: self
+            - task: Docker@2
+              inputs:
+                command: buildAndPush
+                repository: $(registry)/${{ svc.image }}
+                containerRegistry: sc-acr
+                dockerfile: services/${{ svc.name }}/Dockerfile
+                buildContext: services/${{ svc.name }}
+                tags: $(Build.BuildId)
+
+  - stage: InstallDapr
+    displayName: Install / Upgrade Dapr Control Plane
+    dependsOn: BuildServices
+    jobs:
+      - deployment: DaprControlPlane
+        environment: ${{ parameters.environment }}/dapr-system
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - bash: |
+                    wget -q https://raw.githubusercontent.com/dapr/cli/master/install/install.sh -O - | /bin/bash
+                    dapr version
+                  displayName: Install Dapr CLI
+
+                - task: Kubernetes@1
+                  displayName: Check Dapr installed
+                  inputs:
+                    kubernetesServiceEndpoint: sc-aks-${{ parameters.environment }}
+                    command: get
+                    arguments: namespace dapr-system
+                  continueOnError: true
+                  name: checkDapr
+
+                - bash: |
+                    # Initialize/upgrade Dapr on cluster
+                    dapr init -k \
+                      --runtime-version ${{ parameters.daprVersion }} \
+                      --wait \
+                      --timeout 300
+                  displayName: Init Dapr on Kubernetes
+                  env:
+                    KUBECONFIG: $(kubeconfig)
+
+                - task: Kubernetes@1
+                  displayName: Verify Dapr pods
+                  inputs:
+                    kubernetesServiceEndpoint: sc-aks-${{ parameters.environment }}
+                    namespace: dapr-system
+                    command: get
+                    arguments: pods -o wide
+
+  - stage: DeployDaprComponents
+    displayName: Deploy Dapr Components
+    dependsOn: InstallDapr
+    jobs:
+      - deployment: DaprComponents
+        environment: ${{ parameters.environment }}/$(namespace)
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                # Create namespace with Dapr annotation
+                - task: Kubernetes@1
+                  displayName: Create service namespace
+                  inputs:
+                    kubernetesServiceEndpoint: sc-aks-${{ parameters.environment }}
+                    command: apply
+                    arguments: -f k8s/namespace.yml
+
+                # State Store (Azure Redis / Table Storage)
+                - task: KubernetesManifest@1
+                  displayName: Deploy state store component
+                  inputs:
+                    action: deploy
+                    kubernetesServiceConnection: sc-aks-${{ parameters.environment }}
+                    namespace: $(namespace)
+                    manifests: dapr/components/state-store.yml
+
+                # Pub/Sub (Azure Service Bus)
+                - task: KubernetesManifest@1
+                  displayName: Deploy pub/sub component
+                  inputs:
+                    action: deploy
+                    kubernetesServiceConnection: sc-aks-${{ parameters.environment }}
+                    namespace: $(namespace)
+                    manifests: dapr/components/pubsub.yml
+
+                # Bindings (Blob, Event Grid output)
+                - task: KubernetesManifest@1
+                  displayName: Deploy binding components
+                  inputs:
+                    action: deploy
+                    kubernetesServiceConnection: sc-aks-${{ parameters.environment }}
+                    namespace: $(namespace)
+                    manifests: |
+                      dapr/components/binding-blob.yml
+                      dapr/components/binding-eventgrid.yml
+
+                # Resiliency policy
+                - task: KubernetesManifest@1
+                  displayName: Deploy resiliency policy
+                  inputs:
+                    action: deploy
+                    kubernetesServiceConnection: sc-aks-${{ parameters.environment }}
+                    namespace: $(namespace)
+                    manifests: dapr/resiliency/default-policy.yml
+
+  - stage: DeployServices
+    displayName: Deploy Microservices with Dapr Sidecars
+    dependsOn: DeployDaprComponents
+    jobs:
+      - ${{ each svc in parameters.services }}:
+        - deployment: Deploy_${{ replace(svc.name, '-', '_') }}
+          displayName: Deploy ${{ svc.name }}
+          environment: ${{ parameters.environment }}/$(namespace)
+          strategy:
+            runOnce:
+              deploy:
+                steps:
+                  - checkout: self
+
+                  # Patch deployment manifest with Dapr annotations
+                  - bash: |
+                      cat k8s/services/${{ svc.name }}/deployment.yml | \
+                        sed "s/DAPR_APP_ID/${{ svc.appId }}/g" | \
+                        sed "s/DAPR_APP_PORT/${{ svc.port }}/g" | \
+                        sed "s/IMAGE_TAG/$(Build.BuildId)/g" | \
+                        sed "s/REGISTRY/$(registry)/g" \
+                        > /tmp/${{ svc.name }}-deployment.yml
+                      cat /tmp/${{ svc.name }}-deployment.yml
+                    displayName: Template deployment manifest
+
+                  - task: KubernetesManifest@1
+                    displayName: Deploy ${{ svc.name }}
+                    inputs:
+                      action: deploy
+                      kubernetesServiceConnection: sc-aks-${{ parameters.environment }}
+                      namespace: $(namespace)
+                      manifests: /tmp/${{ svc.name }}-deployment.yml
+                      containers: $(registry)/${{ svc.image }}:$(Build.BuildId)
+
+                  - task: Kubernetes@1
+                    displayName: Verify ${{ svc.name }} sidecar
+                    inputs:
+                      kubernetesServiceEndpoint: sc-aks-${{ parameters.environment }}
+                      namespace: $(namespace)
+                      command: get
+                      arguments: pods -l app=${{ svc.name }} -o wide
+
+  - stage: ServiceMeshTests
+    displayName: Dapr Service Invocation Tests
+    dependsOn: DeployServices
+    jobs:
+      - job: DaprTests
+        steps:
+          - checkout: self
+          - bash: npm ci
+            workingDirectory: tests/dapr-integration
+          - bash: |
+              npm test -- \
+                --baseUrl https://api-gateway.${{ parameters.environment }}.mycompany.com \
+                --daprPort 3500
+            workingDirectory: tests/dapr-integration
+            displayName: Run Dapr integration tests
+          - task: PublishTestResults@2
+            condition: always()
+            inputs:
+              testResultsFormat: JUnit
+              testResultsFiles: tests/dapr-integration/results/*.xml
+              testRunTitle: Dapr Mesh Integration Tests
+
+      - job: DaprDashboard
+        dependsOn: DaprTests
+        steps:
+          - bash: |
+              # Output Dapr component status
+              kubectl get components -n $(namespace) -o table
+              echo ""
+              # Output active subscriptions
+              kubectl get subscriptions -n $(namespace) -o table
+            displayName: Show Dapr component status
+            env:
+              KUBECONFIG: $(kubeconfig)

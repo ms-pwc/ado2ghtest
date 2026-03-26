@@ -1,0 +1,156 @@
+# ============================================================
+# Pipeline 67: Release Notes & Changelog Generation
+# Complexity: Complex
+# Concepts: git log parsing, GitHub releases API, changelog
+#           conventional commits, JIRA ticket extraction,
+#           release artifact bundling
+# ============================================================
+
+trigger:
+  tags:
+    include:
+      - v*                # trigger only on version tags
+
+variables:
+  gitHubServiceConnection: sc-github
+  gitHubRepo: myorg/myapp
+  jiraBaseUrl: https://mycompany.atlassian.net
+  releaseTag: $(Build.SourceBranchName)    # e.g. v1.2.3
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: GenerateChangelog
+    displayName: Generate Changelog & Release Notes
+    jobs:
+      - job: Changelog
+        steps:
+          - checkout: self
+            fetchDepth: 0    # full history needed
+
+          # Install conventional-changelog-cli
+          - task: NodeTool@0
+            inputs:
+              versionSpec: '20.x'
+
+          - script: |
+              npm install -g conventional-changelog-cli conventional-commits-parser
+            displayName: Install changelog tools
+
+          # Get the previous tag for range
+          - bash: |
+              PREV_TAG=$(git tag --sort=-version:refname | grep -E '^v[0-9]' | sed -n '2p')
+              echo "Previous tag: $PREV_TAG"
+              echo "Current tag : $(releaseTag)"
+              echo "##vso[task.setvariable variable=previousTag]$PREV_TAG"
+            displayName: Find previous tag
+
+          # Generate conventional changelog
+          - bash: |
+              conventional-changelog \
+                -p angular \
+                -i CHANGELOG.md \
+                -s \
+                -r 1
+
+              echo "=== Generated Changelog ==="
+              head -100 CHANGELOG.md
+            displayName: Generate CHANGELOG.md
+
+          # Extract commits since last tag
+          - bash: |
+              PREV=$(previousTag)
+              echo "Commits since $PREV:"
+              
+              git log "$PREV"..HEAD \
+                --pretty=format:"- %s (%h)" \
+                --no-merges \
+                | tee $(Agent.TempDirectory)/commits.txt
+            displayName: Extract commit messages
+
+          # Extract JIRA tickets from commit messages
+          - bash: |
+              grep -oP '[A-Z]+-[0-9]+' $(Agent.TempDirectory)/commits.txt \
+                | sort -u \
+                | tee $(Agent.TempDirectory)/jira-tickets.txt
+              
+              echo ""
+              echo "JIRA tickets mentioned:"
+              cat $(Agent.TempDirectory)/jira-tickets.txt
+            displayName: Extract JIRA ticket references
+
+          # Build release notes markdown
+          - bash: |
+              cat > $(Agent.TempDirectory)/release-notes.md <<EOF
+              # Release $(releaseTag)
+              
+              **Date**: $(date -u +%Y-%m-%d)
+              **Build**: $(Build.BuildNumber)
+              
+              ## What's Changed
+              
+              $(cat $(Agent.TempDirectory)/commits.txt)
+              
+              ## JIRA Tickets
+              
+              $(while read ticket; do
+                echo "- [$ticket]($(jiraBaseUrl)/browse/$ticket)"
+              done < $(Agent.TempDirectory)/jira-tickets.txt)
+              
+              ## Full Changelog
+              
+              **$PREV_TAG...$(releaseTag)**: https://github.com/$(gitHubRepo)/compare/$PREV_TAG...$(releaseTag)
+              EOF
+              
+              cat $(Agent.TempDirectory)/release-notes.md
+            displayName: Build release notes
+
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: $(Agent.TempDirectory)/release-notes.md
+              artifact: release-notes
+
+  - stage: CreateGitHubRelease
+    displayName: Create GitHub Release
+    dependsOn: GenerateChangelog
+    jobs:
+      - job: GitHubRelease
+        steps:
+          - checkout: self
+            fetchDepth: 0
+
+          - download: current
+            artifact: release-notes
+
+          # Build release artifacts
+          - task: UseDotNet@2
+            inputs:
+              version: '8.x'
+
+          - task: DotNetCoreCLI@2
+            displayName: Publish release binaries
+            inputs:
+              command: publish
+              publishWebProjects: true
+              arguments: --configuration Release --output $(Build.ArtifactStagingDirectory)/release
+              zipAfterPublish: true
+
+          # Create GitHub Release with release notes
+          - task: GitHubRelease@1
+            displayName: Create GitHub Release
+            inputs:
+              gitHubConnection: $(gitHubServiceConnection)
+              repositoryName: $(gitHubRepo)
+              action: create
+              target: $(Build.SourceVersion)
+              tagSource: gitTag
+              tagPattern: 'v*'
+              releaseNotesSource: filePath
+              releaseNotesFilePath: $(Pipeline.Workspace)/release-notes/release-notes.md
+              assets: $(Build.ArtifactStagingDirectory)/release/**/*.zip
+              assetUploadMode: replace
+              isDraft: false
+              isPreRelease: ${{ contains(variables['Build.SourceBranchName'], 'rc') }}
+              addChangeLog: false

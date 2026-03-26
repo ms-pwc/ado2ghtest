@@ -1,0 +1,56 @@
+# ============================================================
+# Pipeline 17: Timeout, Retry & Cancel
+# Complexity: Simple
+# Concepts: timeoutInMinutes (job & step level), cancelTimeoutInMinutes,
+#           retryCountOnTaskFailure, continueOnError
+# ============================================================
+
+trigger:
+  - main
+
+pool:
+  vmImage: ubuntu-latest
+
+jobs:
+  - job: TimeoutDemo
+    displayName: Timeout & Retry Demo
+    timeoutInMinutes: 10          # job will be cancelled after 10 min
+    cancelTimeoutInMinutes: 2     # grace period after cancellation signal
+
+    steps:
+      # Step-level timeout (3 minutes)
+      - bash: |
+          echo "Starting long-ish task..."
+          sleep 5
+          echo "Task completed within timeout."
+        displayName: Step with 3-min timeout
+        timeoutInMinutes: 3
+
+      # Retry on failure (up to 2 retries)
+      - bash: |
+          echo "Attempt number: $ATTEMPT"
+          # Simulate intermittent failure on first attempt
+          if [ "$ATTEMPT" = "1" ]; then
+            echo "Simulating transient failure..."
+            exit 1
+          fi
+          echo "Succeeded on retry!"
+        displayName: Step with retry
+        retryCountOnTaskFailure: 2
+        env:
+          ATTEMPT: "1"            # in real usage, use a counter script
+
+      # Task with retries using official task
+      - task: CmdLine@2
+        displayName: CmdLine with retry
+        retryCountOnTaskFailure: 1
+        inputs:
+          script: echo "This task may be retried once on failure"
+
+      # Continue-on-error so the job doesn't fail
+      - bash: exit 1
+        displayName: Failing step (continueOnError)
+        continueOnError: true
+
+      - bash: echo "Job still alive after continueOnError step"
+        displayName: Post-failure step

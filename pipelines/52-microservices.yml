@@ -1,0 +1,112 @@
+# ============================================================
+# Pipeline 52: Microservices – Build & Deploy Multiple Services
+# Complexity: Complex
+# Concepts: parallel multi-service builds, shared template,
+#           image tagging strategy, sequential deploy with
+#           inter-service health checks, service mesh readiness
+# ============================================================
+
+trigger:
+  branches:
+    include: [main]
+  paths:
+    include: [services/**]
+
+parameters:
+  - name: services
+    type: object
+    default:
+      - name: user-service
+        path: services/user-service
+        port: 8080
+      - name: order-service
+        path: services/order-service
+        port: 8081
+      - name: inventory-service
+        path: services/inventory-service
+        port: 8082
+      - name: notification-service
+        path: services/notification-service
+        port: 8083
+
+variables:
+  containerRegistry: myacr.azurecr.io
+  imageTag: $(Build.BuildId)
+  k8sNamespace: microservices-prod
+  aksServiceConnection: sc-aks-prod
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  # ── Build all services in parallel ───────────────────────────
+  - stage: BuildAll
+    displayName: Build All Services
+    jobs:
+      - ${{ each svc in parameters.services }}:
+        - job: Build_${{ replace(svc.name, '-', '_') }}
+          displayName: Build ${{ svc.name }}
+          steps:
+            - checkout: self
+            - task: Docker@2
+              displayName: Build & push ${{ svc.name }}
+              inputs:
+                command: buildAndPush
+                dockerfile: ${{ svc.path }}/Dockerfile
+                buildContext: ${{ svc.path }}
+                repository: $(containerRegistry)/${{ svc.name }}
+                containerRegistry: sc-acr
+                tags: |
+                  $(imageTag)
+                  latest
+
+            - bash: |
+                echo "Service    : ${{ svc.name }}"
+                echo "Image      : $(containerRegistry)/${{ svc.name }}:$(imageTag)"
+                echo "##vso[task.setvariable variable=${{ replace(svc.name, '-', '_') }}_built;isOutput=true]true"
+              name: buildInfo
+              displayName: Set build status
+
+  # ── Test all services (integration) ──────────────────────────
+  - stage: IntegrationTests
+    displayName: Integration Tests
+    dependsOn: BuildAll
+    jobs:
+      - job: RunIntegration
+        services:
+          postgres: {image: postgres:15, env: {POSTGRES_PASSWORD: test}}
+          redis:    {image: redis:7-alpine}
+        steps:
+          - checkout: self
+          - script: echo "Running inter-service integration tests..."
+            displayName: Cross-service tests
+
+  # ── Deploy each service sequentially ─────────────────────────
+  - stage: DeployDev
+    displayName: Deploy to Dev
+    dependsOn: IntegrationTests
+    jobs:
+      - ${{ each svc in parameters.services }}:
+        - deployment: Deploy_${{ replace(svc.name, '-', '_') }}
+          displayName: Deploy ${{ svc.name }}
+          environment: dev/${{ svc.name }}
+          strategy:
+            runOnce:
+              deploy:
+                steps:
+                  - task: KubernetesManifest@1
+                    displayName: Deploy ${{ svc.name }}
+                    inputs:
+                      action: deploy
+                      kubernetesServiceConnection: $(aksServiceConnection)
+                      namespace: $(k8sNamespace)
+                      manifests: services/${{ svc.name }}/k8s/
+                      containers: $(containerRegistry)/${{ svc.name }}:$(imageTag)
+
+                  - bash: |
+                      echo "Checking ${{ svc.name }} readiness..."
+                      kubectl rollout status deployment/${{ svc.name }} \
+                        -n $(k8sNamespace) --timeout=3m
+                    displayName: Readiness check ${{ svc.name }}
+                    continueOnError: true

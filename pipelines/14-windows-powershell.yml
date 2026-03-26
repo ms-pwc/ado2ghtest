@@ -1,0 +1,62 @@
+# ============================================================
+# Pipeline 14: Windows Agent – PowerShell Native Steps
+# Complexity: Simple
+# Concepts: windows vmImage, PowerShell task, pwsh task,
+#           environment variables in PS, Write-Host, $env:
+# ============================================================
+
+trigger:
+  - main
+
+pool:
+  vmImage: windows-latest
+
+steps:
+  - checkout: self
+
+  # Classic PowerShell task (Windows PowerShell 5.x)
+  - task: PowerShell@2
+    displayName: PowerShell – System info
+    inputs:
+      targetType: inline
+      script: |
+        Write-Host "Computer   : $env:COMPUTERNAME"
+        Write-Host "OS         : $([System.Environment]::OSVersion.VersionString)"
+        Write-Host "PowerShell : $($PSVersionTable.PSVersion)"
+        Write-Host "Build ID   : $(Build.BuildId)"
+
+  # pwsh task – PowerShell Core (cross-platform)
+  - task: PowerShell@2
+    displayName: PowerShell Core – list files
+    inputs:
+      targetType: inline
+      pwsh: true          # use pwsh instead of powershell.exe
+      script: |
+        Get-ChildItem -Path $(System.DefaultWorkingDirectory) -Recurse -Depth 1 |
+          Select-Object Name, Length, LastWriteTime |
+          Format-Table -AutoSize
+
+  # Inline script (cmd.exe on Windows)
+  - script: |
+      echo Build number: $(Build.BuildNumber)
+      echo Source branch: $(Build.SourceBranch)
+      dir
+    displayName: CMD – print env and list dir
+
+  # PowerShell with error handling
+  - task: PowerShell@2
+    displayName: PowerShell – error handling demo
+    inputs:
+      targetType: inline
+      failOnStderr: false
+      script: |
+        $ErrorActionPreference = 'Continue'
+        try {
+          Write-Host "Attempting operation..."
+          # Simulate a recoverable warning
+          Write-Warning "This is just a warning, not a failure"
+          Write-Host "Operation completed."
+        } catch {
+          Write-Error "Caught: $_"
+          exit 1
+        }

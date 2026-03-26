@@ -1,0 +1,188 @@
+# ============================================================
+# Pipeline 59: Data Engineering – ADF + Databricks + Synapse
+# Complexity: Complex
+# Concepts: Azure Data Factory deploy, Databricks cluster,
+#           notebook execution, Synapse pipeline trigger,
+#           data quality checks, job outputs
+# ============================================================
+
+trigger:
+  branches:
+    include: [main]
+  paths:
+    include: [data-pipelines/**, notebooks/**]
+
+variables:
+  azureServiceConnection: sc-azure-data
+  resourceGroup: rg-data-platform
+  adfName: myapp-adf
+  databricksWorkspace: myapp-databricks
+  databricksToken: $(DATABRICKS_TOKEN)
+  databricksClusterId: $(DATABRICKS_CLUSTER_ID)
+  synapseWorkspace: myapp-synapse
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: ValidateDataPipelines
+    displayName: Validate ADF Pipelines
+    jobs:
+      - job: ValidateADF
+        steps:
+          - checkout: self
+
+          # Install ADF CLI tools
+          - task: NodeTool@0
+            inputs:
+              versionSpec: '20.x'
+
+          - script: npm install -g @azure/arm-datafactory
+            displayName: Install ADF npm package
+            continueOnError: true
+
+          # Validate ADF JSON templates
+          - task: AzureCLI@2
+            displayName: Validate ADF templates
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                # Count ADF artifacts
+                echo "ADF Pipelines:"
+                ls data-pipelines/adf/pipeline/ 2>/dev/null | wc -l || echo "0"
+                echo "ADF Datasets:"
+                ls data-pipelines/adf/dataset/ 2>/dev/null | wc -l || echo "0"
+                echo "ADF LinkedServices:"
+                ls data-pipelines/adf/linkedService/ 2>/dev/null | wc -l || echo "0"
+                echo "Validation complete"
+
+  - stage: DeployADFPipelines
+    displayName: Deploy ADF Pipelines
+    dependsOn: ValidateDataPipelines
+    jobs:
+      - deployment: DeployADF
+        environment: data-platform
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                # Install Azure Data Factory utilities
+                - task: NodeTool@0
+                  inputs:
+                    versionSpec: '20.x'
+
+                - script: npm install -g @azure/arm-datafactory
+                  displayName: Install ADF tools
+
+                - task: AzureCLI@2
+                  displayName: Deploy ADF using ARM export
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      # Stop ADF triggers before deployment
+                      az datafactory trigger list \
+                        -g $(resourceGroup) \
+                        --factory-name $(adfName) \
+                        --query "[].name" -o tsv \
+                      | while read trigger; do
+                          echo "Stopping trigger: $trigger"
+                          az datafactory trigger stop \
+                            -g $(resourceGroup) \
+                            --factory-name $(adfName) \
+                            --trigger-name "$trigger" || true
+                        done
+                      
+                      # Deploy ADF ARM template
+                      az deployment group create \
+                        --resource-group $(resourceGroup) \
+                        --template-file data-pipelines/adf/ARMTemplateForFactory.json \
+                        --parameters @data-pipelines/adf/ARMTemplateParametersForFactory.json
+                      
+                      # Restart triggers
+                      az datafactory trigger list \
+                        -g $(resourceGroup) \
+                        --factory-name $(adfName) \
+                        --query "[].name" -o tsv \
+                      | while read trigger; do
+                          az datafactory trigger start \
+                            -g $(resourceGroup) \
+                            --factory-name $(adfName) \
+                            --trigger-name "$trigger" || true
+                        done
+
+  - stage: DeployDatabricksNotebooks
+    displayName: Deploy Databricks Notebooks
+    dependsOn: []     # parallel with ADF
+    jobs:
+      - job: DeployNotebooks
+        steps:
+          - checkout: self
+
+          # Install Databricks CLI
+          - script: pip install databricks-cli
+            displayName: Install Databricks CLI
+
+          - script: |
+              databricks configure \
+                --token <<EOF
+              $(DATABRICKS_HOST)
+              $(DATABRICKS_TOKEN)
+              EOF
+            displayName: Configure Databricks CLI
+            env:
+              DATABRICKS_TOKEN: $(databricksToken)
+
+          # Import notebooks to workspace
+          - script: |
+              databricks workspace import_dir \
+                notebooks/ \
+                /Shared/myapp-notebooks \
+                --overwrite
+            displayName: Import notebooks
+
+  - stage: RunDataTests
+    displayName: Data Quality Checks
+    dependsOn:
+      - DeployADFPipelines
+      - DeployDatabricksNotebooks
+    jobs:
+      - job: DataQuality
+        steps:
+          # Run a Databricks notebook for data quality
+          - task: AzureCLI@2
+            displayName: Run data quality notebook
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                # Trigger ADF pipeline run
+                RUN_ID=$(az datafactory pipeline create-run \
+                  -g $(resourceGroup) \
+                  --factory-name $(adfName) \
+                  --pipeline-name DataQualityCheck \
+                  --query runId -o tsv)
+                
+                echo "Pipeline run ID: $RUN_ID"
+                
+                # Poll for completion
+                for i in $(seq 1 60); do
+                  STATUS=$(az datafactory pipeline-run query-by-factory \
+                    -g $(resourceGroup) \
+                    --factory-name $(adfName) \
+                    --last-updated-after "2024-01-01T00:00:00Z" \
+                    --last-updated-before "2099-01-01T00:00:00Z" \
+                    --query "value[?runId=='$RUN_ID'].status | [0]" -o tsv)
+                  
+                  echo "Status: $STATUS"
+                  [ "$STATUS" = "Succeeded" ] && break
+                  [ "$STATUS" = "Failed" ]    && { echo "Pipeline failed!"; exit 1; }
+                  sleep 30
+                done

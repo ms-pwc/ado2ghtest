@@ -1,0 +1,53 @@
+# ============================================================
+# Variable Template: templates/vars-environments.yml
+# Concepts: variable template with parameters, object param,
+#           compile-time if/elseif/else to set env-specific vars
+# ============================================================
+
+parameters:
+  - name: environment
+    type: string
+    default: dev
+    values: [dev, staging, production]
+
+variables:
+
+  - name: ENVIRONMENT
+    value: ${{ parameters.environment }}
+
+  # App URLs per environment
+  - ${{ if eq(parameters.environment, 'dev') }}:
+    - name: APP_URL
+      value: https://myapp-dev.azurewebsites.net
+    - name: DB_HOST
+      value: myapp-dev-sql.database.windows.net
+    - name: REGION
+      value: eastus
+    - name: REPLICAS
+      value: 1
+    - name: LOG_LEVEL
+      value: Debug
+
+  - ${{ elseif eq(parameters.environment, 'staging') }}:
+    - name: APP_URL
+      value: https://myapp-staging.azurewebsites.net
+    - name: DB_HOST
+      value: myapp-staging-sql.database.windows.net
+    - name: REGION
+      value: eastus
+    - name: REPLICAS
+      value: 2
+    - name: LOG_LEVEL
+      value: Information
+
+  - ${{ else }}:
+    - name: APP_URL
+      value: https://myapp.azurewebsites.net
+    - name: DB_HOST
+      value: myapp-prod-sql.database.windows.net
+    - name: REGION
+      value: eastus2
+    - name: REPLICAS
+      value: 5
+    - name: LOG_LEVEL
+      value: Warning

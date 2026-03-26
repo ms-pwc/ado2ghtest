@@ -1,0 +1,97 @@
+# ============================================================
+# Pipeline 50: Java Gradle – Multi-Module Build
+# Complexity: Medium
+# Concepts: Gradle multi-project, test aggregation,
+#           JaCoCo merged coverage, Gradle scan, publishToMavenLocal
+# ============================================================
+
+trigger:
+  branches:
+    include: [main, develop]
+  paths:
+    include: ['**/*.java', build.gradle, settings.gradle, '**/build.gradle']
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  GRADLE_USER_HOME: $(Pipeline.Workspace)/.gradle
+  javaVersion: '17'
+
+steps:
+  - checkout: self
+
+  - task: JavaToolInstaller@0
+    displayName: Install JDK $(javaVersion)
+    inputs:
+      versionSpec: $(javaVersion)
+      jdkArchitectureOption: x64
+      jdkSourceOption: PreInstalled
+
+  # Cache Gradle wrapper and dependencies
+  - task: Cache@2
+    displayName: Cache Gradle home
+    inputs:
+      key: 'gradle | "$(Agent.OS)" | **/build.gradle | **/gradle.properties'
+      restoreKeys: gradle | "$(Agent.OS)"
+      path: $(GRADLE_USER_HOME)
+
+  - task: Gradle@3
+    displayName: Build all modules
+    inputs:
+      gradleWrapperFile: gradlew
+      tasks: clean build
+      options: >
+        --no-daemon
+        --parallel
+        --build-cache
+        -x test
+      publishJUnitResults: false
+      javaHomeOption: JDKVersion
+      jdkVersionOption: '1.$(javaVersion)'
+
+  - task: Gradle@3
+    displayName: Run all tests
+    inputs:
+      gradleWrapperFile: gradlew
+      tasks: test jacocoMergedReport
+      options: >
+        --no-daemon
+        --parallel
+        -x build
+      publishJUnitResults: true
+      testResultsFiles: '**/build/test-results/**/TEST-*.xml'
+      javaHomeOption: JDKVersion
+      jdkVersionOption: '1.$(javaVersion)'
+      codeCoverageToolOption: JaCoCo
+      codeCoverageClassFilesDirectories: |
+        **/build/classes/java/main
+        **/build/classes/kotlin/main
+      codeCoverageSourceDirectories: |
+        **/src/main/java
+        **/src/main/kotlin
+
+  # Build fat JARs / bootJar
+  - task: Gradle@3
+    displayName: Build bootable JARs
+    inputs:
+      gradleWrapperFile: gradlew
+      tasks: bootJar
+      options: --no-daemon -x test
+      javaHomeOption: JDKVersion
+      jdkVersionOption: '1.$(javaVersion)'
+
+  # Collect all JARs into staging
+  - task: CopyFiles@2
+    displayName: Collect JARs
+    inputs:
+      SourceFolder: .
+      Contents: '**/build/libs/*-SNAPSHOT.jar'
+      TargetFolder: $(Build.ArtifactStagingDirectory)
+      flattenFolders: false
+
+  - task: PublishPipelineArtifact@1
+    displayName: Publish JARs
+    inputs:
+      targetPath: $(Build.ArtifactStagingDirectory)
+      artifact: gradle-jars

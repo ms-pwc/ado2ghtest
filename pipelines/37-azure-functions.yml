@@ -1,0 +1,127 @@
+# ============================================================
+# Pipeline 37: Azure Functions – Build & Deploy
+# Complexity: Medium
+# Concepts: AzureFunctionApp task, Function App settings,
+#           zip deploy, slot swap, consumption plan
+# ============================================================
+
+trigger:
+  branches:
+    include: [main]
+  paths:
+    include: [functions/**]
+
+variables:
+  azureServiceConnection: sc-azure-prod
+  functionAppName: myapp-functions
+  resourceGroup: rg-myapp-prod
+  dotnetVersion: '8.x'
+  buildConfiguration: Release
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: Build
+    jobs:
+      - job: BuildFunctions
+        steps:
+          - checkout: self
+
+          - task: UseDotNet@2
+            inputs:
+              version: $(dotnetVersion)
+
+          - task: DotNetCoreCLI@2
+            displayName: dotnet restore
+            inputs:
+              command: restore
+              projects: functions/**/*.csproj
+
+          - task: DotNetCoreCLI@2
+            displayName: dotnet build
+            inputs:
+              command: build
+              projects: functions/**/*.csproj
+              arguments: --configuration $(buildConfiguration) --no-restore
+
+          - task: DotNetCoreCLI@2
+            displayName: dotnet test
+            inputs:
+              command: test
+              projects: functions/**/*.Tests.csproj
+              arguments: --no-build --configuration $(buildConfiguration)
+              publishTestResults: true
+
+          - task: DotNetCoreCLI@2
+            displayName: dotnet publish
+            inputs:
+              command: publish
+              publishWebProjects: false
+              projects: functions/**/*.csproj
+              arguments: --configuration $(buildConfiguration) --output $(Build.ArtifactStagingDirectory)/functions
+              zipAfterPublish: true
+
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: $(Build.ArtifactStagingDirectory)/functions
+              artifact: functions-zip
+
+  - stage: DeployStaging
+    displayName: Deploy to Staging Slot
+    dependsOn: Build
+    jobs:
+      - deployment: FuncDeploy
+        environment: staging
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: functions-zip
+
+                # Configure Function App settings on staging slot
+                - task: AzureFunctionAppSettings@1
+                  displayName: Configure staging app settings
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    appName: $(functionAppName)
+                    resourceGroupName: $(resourceGroup)
+                    slotName: staging
+                    appSettings: |
+                      ENVIRONMENT=Staging
+                      BUILD_ID=$(Build.BuildId)
+
+                # Deploy to Function App staging slot
+                - task: AzureFunctionApp@2
+                  displayName: Deploy to staging slot
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    appType: functionApp
+                    appName: $(functionAppName)
+                    deployToSlotOrASE: true
+                    resourceGroupName: $(resourceGroup)
+                    slotName: staging
+                    package: $(Pipeline.Workspace)/functions-zip/**/*.zip
+                    deploymentMethod: zipDeploy
+
+  - stage: DeployProd
+    displayName: Swap to Production
+    dependsOn: DeployStaging
+    jobs:
+      - deployment: ProdSwap
+        environment: production
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureAppServiceManage@0
+                  displayName: Swap staging → production
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    Action: Swap Slots
+                    WebAppName: $(functionAppName)
+                    ResourceGroupName: $(resourceGroup)
+                    SourceSlot: staging
+                    SwapWithProduction: true

@@ -1,0 +1,228 @@
+# ============================================================
+# Pipeline 89: Playwright End-to-End Synthetic Monitoring
+# Complexity: Highly Complex
+# Concepts: Playwright test execution in ADO, multi-browser
+#           matrix, trace collection, screenshot on failure,
+#           Azure App Insights availability tests via REST,
+#           scheduled synthetic checks, report publishing,
+#           alert on degradation, retry with video capture
+# ============================================================
+
+trigger:
+  branches:
+    include: [main]
+  paths:
+    include: [e2e/**, playwright.config.ts]
+
+schedules:
+  - cron: '*/15 * * * *'    # Every 15 minutes for synthetic monitoring
+    displayName: Synthetic monitoring check
+    branches:
+      include: [main]
+    always: true
+
+parameters:
+  - name: environment
+    type: string
+    default: prod
+    values: [staging, prod]
+  - name: baseUrl
+    type: string
+    default: ''
+    displayName: Override base URL (leave empty for env default)
+  - name: testSuite
+    type: string
+    default: smoke
+    values: [smoke, regression, full]
+  - name: browsers
+    type: object
+    default:
+      - name: chromium
+        short: cr
+      - name: firefox
+        short: ff
+      - name: webkit
+        short: wk
+
+variables:
+  - group: playwright-${{ parameters.environment }}-vars
+  - name: effectiveUrl
+    value: ${{ coalesce(parameters.baseUrl, variables['defaultBaseUrl']) }}
+  - name: playwrightVersion
+    value: 1.42.1
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: InstallAndCache
+    displayName: Setup Playwright
+    jobs:
+      - job: Setup
+        steps:
+          - checkout: self
+          - task: NodeTool@0
+            inputs: { versionSpec: '20.x' }
+          - task: Cache@2
+            inputs:
+              key: 'playwright | $(Agent.OS) | package-lock.json'
+              restoreKeys: 'playwright | $(Agent.OS)'
+              path: $(Pipeline.Workspace)/.playwright
+            displayName: Cache Playwright browsers
+          - bash: npm ci
+          - bash: |
+              PLAYWRIGHT_BROWSERS_PATH=$(Pipeline.Workspace)/.playwright \
+                npx playwright install --with-deps
+            displayName: Install Playwright browsers
+
+  - stage: RunTests
+    displayName: Execute E2E Tests
+    dependsOn: InstallAndCache
+    jobs:
+      # Run browsers in parallel with matrix
+      - ${{ each browser in parameters.browsers }}:
+        - job: E2E_${{ browser.short }}
+          displayName: E2E – ${{ browser.name }}
+          timeoutInMinutes: 30
+          steps:
+            - checkout: self
+            - task: NodeTool@0
+              inputs: { versionSpec: '20.x' }
+            - task: Cache@2
+              inputs:
+                key: 'playwright | $(Agent.OS) | package-lock.json'
+                path: $(Pipeline.Workspace)/.playwright
+            - bash: npm ci
+
+            - bash: |
+                PLAYWRIGHT_BROWSERS_PATH=$(Pipeline.Workspace)/.playwright \
+                npx playwright test \
+                  --project=${{ browser.name }} \
+                  --grep="@${{ parameters.testSuite }}" \
+                  --reporter=junit,html \
+                  --output=test-results/${{ browser.short }} \
+                  --retries=2
+              displayName: Run Playwright – ${{ browser.name }}
+              env:
+                BASE_URL: $(effectiveUrl)
+                ENVIRONMENT: ${{ parameters.environment }}
+                TEST_USER_EMAIL: $(testUserEmail)
+                TEST_USER_PASSWORD: $(testUserPassword)
+              continueOnError: true   # Don't block – collect all results first
+
+            - task: PublishTestResults@2
+              condition: always()
+              inputs:
+                testResultsFormat: JUnit
+                testResultsFiles: 'test-results/${{ browser.short }}/results.xml'
+                testRunTitle: 'Playwright ${{ browser.name }} – ${{ parameters.testSuite }}'
+                mergeTestResults: false
+
+            - task: PublishPipelineArtifact@1
+              condition: always()
+              inputs:
+                targetPath: playwright-report
+                artifactName: playwright-report-${{ browser.short }}
+
+            - task: PublishPipelineArtifact@1
+              condition: failed()
+              inputs:
+                targetPath: test-results/${{ browser.short }}
+                artifactName: test-failures-${{ browser.short }}
+
+  - stage: AnalyzeResults
+    displayName: Analyze Results & Alert
+    dependsOn: RunTests
+    condition: always()
+    jobs:
+      - job: AnalyzeAndAlert
+        steps:
+          - checkout: self
+
+          - task: DownloadPipelineArtifact@2
+            inputs:
+              pattern: playwright-report-*
+              targetPath: $(Pipeline.Workspace)/reports
+
+          - bash: |
+              # Aggregate test results across browsers
+              TOTAL_PASS=0
+              TOTAL_FAIL=0
+              TOTAL_SKIP=0
+
+              for xml in $(find $(Pipeline.Workspace)/reports -name "results.xml"); do
+                BROWSER=$(basename $(dirname $xml))
+                PASS=$(python3 -c "import xml.etree.ElementTree as ET; t=ET.parse('$xml').getroot(); print(int(t.get('tests',0))-int(t.get('failures',0))-int(t.get('skipped',0)))")
+                FAIL=$(python3 -c "import xml.etree.ElementTree as ET; print(ET.parse('$xml').getroot().get('failures',0))")
+                echo "$BROWSER: Pass=$PASS Fail=$FAIL"
+                TOTAL_FAIL=$(( TOTAL_FAIL + FAIL ))
+                TOTAL_PASS=$(( TOTAL_PASS + PASS ))
+              done
+
+              TOTAL=$(( TOTAL_PASS + TOTAL_FAIL ))
+              if [ $TOTAL -gt 0 ]; then
+                PASS_RATE=$(( (TOTAL_PASS * 100) / TOTAL ))
+              else
+                PASS_RATE=0
+              fi
+
+              echo "Total Pass: $TOTAL_PASS / $TOTAL ($PASS_RATE%)"
+              echo "##vso[task.setvariable variable=passRate]$PASS_RATE"
+              echo "##vso[task.setvariable variable=totalFail]$TOTAL_FAIL"
+
+              if [ "$PASS_RATE" -lt "95" ]; then
+                echo "##vso[task.logissue type=error]E2E pass rate below 95%: $PASS_RATE%"
+              fi
+            displayName: Aggregate test results
+
+          - bash: |
+              if [ "$(totalFail)" -gt "0" ] && [ "$(Build.Reason)" = "Schedule" ]; then
+                # Alert via Teams webhook for synthetic monitoring failures
+                curl -sf -X POST "$(teamsWebhook)" \
+                  -H "Content-Type: application/json" \
+                  -d "{
+                    \"type\": \"AdaptiveCard\",
+                    \"version\": \"1.4\",
+                    \"body\": [
+                      {\"type\":\"TextBlock\",\"text\":\"⚠️ Synthetic Monitor Alert\",\"color\":\"Warning\",\"weight\":\"Bolder\"},
+                      {\"type\":\"FactSet\",\"facts\":[
+                        {\"title\":\"Environment\",\"value\":\"${{ parameters.environment }}\"},
+                        {\"title\":\"Failed tests\",\"value\":\"$(totalFail)\"},
+                        {\"title\":\"Pass rate\",\"value\":\"$(passRate)%\"},
+                        {\"title\":\"Time\",\"value\":\"$(date -u)\"},
+                        {\"title\":\"URL\",\"value\":\"$(effectiveUrl)\"}
+                      ]}
+                    ]
+                  }"
+              fi
+            displayName: Alert on synthetic monitoring failure
+            condition: and(always(), gt(variables['totalFail'], 0))
+
+          # Push custom metric to App Insights
+          - bash: |
+              curl -sf -X POST \
+                "https://dc.services.visualstudio.com/v2/track" \
+                -H "Content-Type: application/json" \
+                -d "{
+                  \"iKey\": \"$(appInsightsKey)\",
+                  \"name\": \"Microsoft.ApplicationInsights.Event\",
+                  \"time\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",
+                  \"data\": {
+                    \"baseType\": \"MetricData\",
+                    \"baseData\": {
+                      \"metrics\": [{
+                        \"name\": \"e2e.pass_rate\",
+                        \"value\": $(passRate),
+                        \"count\": 1,
+                        \"kind\": 0
+                      }],
+                      \"properties\": {
+                        \"environment\": \"${{ parameters.environment }}\",
+                        \"suite\": \"${{ parameters.testSuite }}\",
+                        \"buildId\": \"$(Build.BuildId)\"
+                      }
+                    }
+                  }
+                }" || true
+            displayName: Push E2E metrics to App Insights

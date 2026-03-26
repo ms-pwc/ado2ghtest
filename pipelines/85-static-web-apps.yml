@@ -1,0 +1,247 @@
+# ============================================================
+# Pipeline 85: Azure Static Web Apps + CDN Cache Purge
+# Complexity: Highly Complex
+# Concepts: SWA deploy with custom routing rules, API backend
+#           auth config, linked backend, CDN profile purge,
+#           preview environments per PR, lighthouse CI,
+#           A/B testing via rules, rollback via deployment token
+# ============================================================
+
+trigger:
+  branches:
+    include: [main, develop]
+  paths:
+    include: [frontend/**, api/**]
+
+pr:
+  branches:
+    include: ['*']
+  paths:
+    include: [frontend/**, api/**]
+
+parameters:
+  - name: environment
+    type: string
+    default: prod
+    values: [dev, staging, prod]
+  - name: runLighthouse
+    type: boolean
+    default: true
+  - name: purgeCDN
+    type: boolean
+    default: true
+
+variables:
+  - group: swa-${{ parameters.environment }}-vars
+  - name: nodeVersion
+    value: '20.x'
+  - name: isPR
+    value: $[ eq(variables['Build.Reason'], 'PullRequest') ]
+  - name: isMain
+    value: $[ eq(variables['Build.SourceBranchName'], 'main') ]
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: Build
+    displayName: Build Frontend + API
+    jobs:
+      - job: BuildFrontend
+        steps:
+          - checkout: self
+          - task: NodeTool@0
+            inputs: { versionSpec: $(nodeVersion) }
+
+          - bash: npm ci
+            workingDirectory: frontend
+            displayName: Install frontend deps
+
+          - bash: npm run lint
+            workingDirectory: frontend
+            displayName: ESLint check
+
+          - bash: npm test -- --passWithNoTests --coverage
+            workingDirectory: frontend
+            displayName: Frontend unit tests
+
+          - task: PublishTestResults@2
+            condition: always()
+            inputs:
+              testResultsFormat: JUnit
+              testResultsFiles: frontend/coverage/junit.xml
+
+          - bash: |
+              if [ "$(Build.SourceBranchName)" = "main" ]; then
+                npm run build:prod
+              else
+                npm run build:staging
+              fi
+            workingDirectory: frontend
+            displayName: Build frontend
+
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: frontend/dist
+              artifactName: frontend-dist
+
+  - stage: DeployPRPreview
+    displayName: Deploy PR Preview Environment
+    dependsOn: Build
+    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+    jobs:
+      - job: PRPreview
+        steps:
+          - checkout: self
+          - task: DownloadPipelineArtifact@2
+            inputs:
+              artifactName: frontend-dist
+              targetPath: $(Pipeline.Workspace)/frontend-dist
+
+          - task: AzureStaticWebApp@0
+            displayName: Deploy PR preview
+            inputs:
+              app_location: /
+              api_location: api
+              output_location: $(Pipeline.Workspace)/frontend-dist
+              azure_static_web_apps_api_token: $(swaPRToken)
+              deployment_environment: pr-$(System.PullRequest.PullRequestNumber)
+
+          - bash: |
+              # Comment preview URL on PR
+              PR_URL="https://pr-$(System.PullRequest.PullRequestNumber).myapp.azurestaticapps.net"
+              echo "Preview URL: $PR_URL"
+              # (Would post to PR via ADO REST API here)
+            displayName: Output preview URL
+
+  - stage: DeployProduction
+    displayName: Deploy to Production SWA
+    dependsOn: Build
+    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+    jobs:
+      - deployment: SWAProd
+        environment: ${{ parameters.environment }}-swa
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - task: DownloadPipelineArtifact@2
+                  inputs:
+                    artifactName: frontend-dist
+                    targetPath: $(Pipeline.Workspace)/frontend-dist
+
+                - task: AzureStaticWebApp@0
+                  displayName: Deploy Static Web App
+                  inputs:
+                    app_location: /
+                    api_location: api
+                    output_location: $(Pipeline.Workspace)/frontend-dist
+                    azure_static_web_apps_api_token: $(swaProdToken)
+                    production_branch: main
+
+                - task: AzureCLI@2
+                  displayName: Configure SWA custom auth
+                  inputs:
+                    azureSubscription: sc-azure-${{ parameters.environment }}
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      az staticwebapp identity assign \
+                        --name $(swaName) \
+                        --resource-group $(rgName)
+
+                      # Link backend API (App Service or Container App)
+                      az staticwebapp backends link \
+                        --name $(swaName) \
+                        --resource-group $(rgName) \
+                        --backend-resource-id $(backendResourceId) \
+                        --backend-region $(location)
+
+                - task: AzureCLI@2
+                  displayName: Get deployment details
+                  inputs:
+                    azureSubscription: sc-azure-${{ parameters.environment }}
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      SWA_URL=$(az staticwebapp show \
+                        --name $(swaName) \
+                        --resource-group $(rgName) \
+                        --query defaultHostname -o tsv)
+                      echo "SWA URL: https://$SWA_URL"
+                      echo "##vso[task.setvariable variable=swaUrl;isOutput=true]https://$SWA_URL"
+                  name: swaInfo
+
+  - stage: PurgeCDN
+    displayName: Purge CDN Cache
+    dependsOn: DeployProduction
+    condition: and(succeeded(), eq('${{ parameters.purgeCDN }}', 'true'))
+    jobs:
+      - job: PurgeCDN
+        steps:
+          - task: AzureCLI@2
+            displayName: Purge Azure CDN endpoints
+            inputs:
+              azureSubscription: sc-azure-${{ parameters.environment }}
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                # Purge all cached content
+                az cdn endpoint purge \
+                  --resource-group $(rgName) \
+                  --profile-name $(cdnProfileName) \
+                  --name $(cdnEndpointName) \
+                  --content-paths "/*"
+
+                echo "CDN purge initiated for $(cdnEndpointName)"
+
+                # Also purge Front Door if applicable
+                if [ -n "$(afdName)" ]; then
+                  az afd endpoint purge \
+                    --resource-group $(rgName) \
+                    --profile-name $(afdName) \
+                    --endpoint-name $(afdEndpointName) \
+                    --domains $(afdDomain) \
+                    --content-paths "/*"
+                  echo "Azure Front Door purge initiated"
+                fi
+
+  - stage: Lighthouse
+    displayName: Lighthouse Performance Audit
+    dependsOn: DeployProduction
+    condition: and(succeeded(), eq('${{ parameters.runLighthouse }}', 'true'))
+    variables:
+      swaUrl: $[ stageDependencies.DeployProduction.SWAProd.outputs['swaInfo.swaUrl'] ]
+    jobs:
+      - job: LighthouseCI
+        steps:
+          - task: NodeTool@0
+            inputs: { versionSpec: $(nodeVersion) }
+          - bash: npm install -g @lhci/cli
+            displayName: Install Lighthouse CI
+          - bash: |
+              lhci collect \
+                --url "$(swaUrl)" \
+                --url "$(swaUrl)/about" \
+                --url "$(swaUrl)/products" \
+                --numberOfRuns 3
+              
+              lhci assert --preset="lighthouse:recommended" \
+                --assertions.performance=0.9 \
+                --assertions.accessibility=0.95 \
+                --assertions.best-practices=0.9 || true
+            displayName: Run Lighthouse CI
+
+          - bash: |
+              lhci upload \
+                --target filesystem \
+                --outputDir ./lighthouse-reports
+            displayName: Save Lighthouse reports
+
+          - task: PublishPipelineArtifact@1
+            condition: always()
+            inputs:
+              targetPath: lighthouse-reports
+              artifactName: lighthouse-audit

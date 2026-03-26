@@ -1,0 +1,252 @@
+# ============================================================
+# Pipeline 75: Observability Stack Deploy
+# Complexity: Highly Complex
+# Concepts: OpenTelemetry Collector deploy, Prometheus, Grafana,
+#           Application Insights configuration, custom dashboards,
+#           alert rules, SLO/SLI definitions, structured logging
+# ============================================================
+
+trigger:
+  branches:
+    include: [main]
+  paths:
+    include: [observability/**, infra/monitoring/**]
+
+parameters:
+  - name: environment
+    type: string
+    default: prod
+    values: [dev, staging, prod]
+  - name: deployOtelCollector
+    type: boolean
+    default: true
+  - name: deployGrafana
+    type: boolean
+    default: true
+  - name: deployAlerts
+    type: boolean
+    default: true
+
+variables:
+  - group: observability-${{ parameters.environment }}-vars
+  - name: aksNs
+    value: observability
+  - name: grafanaVersion
+    value: '10.3.1'
+  - name: otelVersion
+    value: '0.92.0'
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: ValidateConfig
+    displayName: Validate Observability Config
+    jobs:
+      - job: ValidateYAML
+        steps:
+          - checkout: self
+          - bash: pip install yamllint jsonschema
+            displayName: Install validators
+          - bash: |
+              yamllint observability/otel-collector.yml
+              yamllint observability/prometheus-rules.yml
+            displayName: Lint YAML configs
+          - bash: |
+              # Validate Prometheus rules
+              docker run --rm -v $(pwd)/observability:/workspace \
+                prom/prometheus:latest \
+                promtool check rules /workspace/prometheus-rules.yml
+            displayName: Check Prometheus rules syntax
+
+  - stage: DeployNamespace
+    displayName: Setup Observability Namespace
+    dependsOn: ValidateConfig
+    jobs:
+      - deployment: SetupNS
+        environment: ${{ parameters.environment }}/observability
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - task: Kubernetes@1
+                  displayName: Create namespace
+                  inputs:
+                    kubernetesServiceEndpoint: sc-aks-${{ parameters.environment }}
+                    command: apply
+                    arguments: -f -
+                  # Namespace with monitoring labels
+                - task: Kubernetes@1
+                  displayName: Create image pull secret
+                  inputs:
+                    kubernetesServiceEndpoint: sc-aks-${{ parameters.environment }}
+                    namespace: $(aksNs)
+                    command: create
+                    arguments: >
+                      secret docker-registry acr-secret
+                      --docker-server=$(acrName).azurecr.io
+                      --docker-username=$(acrUser)
+                      --docker-password=$(acrPassword)
+                    continueOnError: true   # already exists on reruns
+
+  - stage: DeployOtelCollector
+    displayName: Deploy OpenTelemetry Collector
+    dependsOn: DeployNamespace
+    condition: and(succeeded(), eq('${{ parameters.deployOtelCollector }}', 'true'))
+    jobs:
+      - deployment: OtelCollector
+        environment: ${{ parameters.environment }}/observability
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - bash: helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts
+                  displayName: Add OTel Helm repo
+
+                - task: HelmDeploy@0
+                  displayName: Deploy OTel Collector
+                  inputs:
+                    connectionType: Kubernetes Service Connection
+                    kubernetesServiceEndpoint: sc-aks-${{ parameters.environment }}
+                    namespace: $(aksNs)
+                    command: upgrade
+                    chartName: open-telemetry/opentelemetry-collector
+                    releaseName: otel-collector
+                    install: true
+                    waitForExecution: true
+                    arguments: >
+                      --version $(otelVersion)
+                      --values observability/otel-collector-values.yml
+                      --set mode=daemonset
+                      --set config.exporters.azuremonitor.connection_string=$(appInsightsConnStr)
+                      --set config.exporters.prometheus.endpoint=0.0.0.0:8889
+
+                # Apply OTel Instrumentation CRD (auto-instrument pods)
+                - task: Kubernetes@1
+                  displayName: Apply auto-instrumentation
+                  inputs:
+                    kubernetesServiceEndpoint: sc-aks-${{ parameters.environment }}
+                    namespace: $(aksNs)
+                    command: apply
+                    arguments: -f observability/auto-instrumentation.yml
+
+  - stage: DeployGrafana
+    displayName: Deploy Grafana + Dashboards
+    dependsOn: DeployOtelCollector
+    condition: and(succeeded(), eq('${{ parameters.deployGrafana }}', 'true'))
+    jobs:
+      - deployment: GrafanaDeploy
+        environment: ${{ parameters.environment }}/observability
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - bash: |
+                    helm repo add grafana https://grafana.github.io/helm-charts
+                    helm repo update
+                  displayName: Add Grafana Helm repo
+
+                - task: HelmDeploy@0
+                  displayName: Deploy Grafana
+                  inputs:
+                    connectionType: Kubernetes Service Connection
+                    kubernetesServiceEndpoint: sc-aks-${{ parameters.environment }}
+                    namespace: $(aksNs)
+                    command: upgrade
+                    chartName: grafana/grafana
+                    releaseName: grafana
+                    install: true
+                    waitForExecution: true
+                    arguments: >
+                      --version $(grafanaVersion)
+                      --set adminPassword=$(grafanaAdminPassword)
+                      --set persistence.enabled=true
+                      --set persistence.size=10Gi
+                      --values observability/grafana-values.yml
+
+                # Import dashboards via Grafana API
+                - bash: |
+                    GRAFANA_URL="https://grafana.${{ parameters.environment }}.mycompany.com"
+
+                    # Wait for Grafana to be ready
+                    for i in $(seq 1 20); do
+                      if curl -sf "$GRAFANA_URL/api/health" > /dev/null; then
+                        echo "Grafana ready"
+                        break
+                      fi
+                      sleep 15
+                    done
+
+                    # Import each dashboard
+                    for dashboard_file in observability/dashboards/*.json; do
+                      DASHBOARD_NAME=$(basename "$dashboard_file" .json)
+                      echo "Importing dashboard: $DASHBOARD_NAME"
+                      curl -sf -X POST \
+                        -H "Content-Type: application/json" \
+                        -u "admin:$(grafanaAdminPassword)" \
+                        "$GRAFANA_URL/api/dashboards/import" \
+                        -d "{\"dashboard\": $(cat $dashboard_file), \"overwrite\": true, \"folderId\": 0}"
+                    done
+                  displayName: Import Grafana dashboards
+
+  - stage: ConfigureAlerts
+    displayName: Configure Alerts & SLOs
+    dependsOn: DeployGrafana
+    condition: and(succeeded(), eq('${{ parameters.deployAlerts }}', 'true'))
+    jobs:
+      - deployment: AlertRules
+        environment: ${{ parameters.environment }}/observability
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                # Azure Monitor alert rules via Bicep
+                - task: AzureCLI@2
+                  displayName: Deploy Azure Monitor alerts
+                  inputs:
+                    azureSubscription: sc-azure-${{ parameters.environment }}
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      az deployment group create \
+                        --resource-group $(rgName) \
+                        --template-file infra/monitoring/alerts.bicep \
+                        --parameters \
+                          environment=${{ parameters.environment }} \
+                          appInsightsId=$(appInsightsId) \
+                          actionGroupId=$(actionGroupId) \
+                          p99LatencyThresholdMs=2000 \
+                          errorRateThresholdPct=1.0 \
+                          availabilityThresholdPct=99.9
+
+                # Deploy SLO definition ConfigMap
+                - task: Kubernetes@1
+                  displayName: Apply SLO definitions
+                  inputs:
+                    kubernetesServiceEndpoint: sc-aks-${{ parameters.environment }}
+                    namespace: $(aksNs)
+                    command: apply
+                    arguments: -f observability/slo-definitions.yml
+
+                # Verify alert rules
+                - task: AzureCLI@2
+                  displayName: List configured alert rules
+                  inputs:
+                    azureSubscription: sc-azure-${{ parameters.environment }}
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      echo "=== Metric Alert Rules ==="
+                      az monitor metrics alert list --resource-group $(rgName) -o table
+
+                      echo ""
+                      echo "=== Log Alert Rules ==="
+                      az monitor scheduled-query list --resource-group $(rgName) -o table

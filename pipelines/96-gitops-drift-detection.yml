@@ -1,0 +1,250 @@
+# ============================================================
+# Pipeline 96: GitOps Reconciliation & Drift Detection
+# Complexity: Highly Complex
+# Concepts: Flux v2 / ArgoCD reconciliation, configuration drift
+#           detection, automated reconciliation, cluster state
+#           comparison, OPA policy evaluation, git-based state
+#           enforcement, alerting on drift, image update automation
+# ============================================================
+
+trigger:
+  branches:
+    include: [main]
+  paths:
+    include: [gitops/**, clusters/**]
+
+schedules:
+  - cron: '*/30 * * * *'
+    displayName: Drift detection every 30 min
+    branches:
+      include: [main]
+    always: true
+
+parameters:
+  - name: clusters
+    type: object
+    default:
+      - name: prod-eastus
+        environment: prod
+        region: eastus
+        fluxNamespace: flux-system
+      - name: prod-westeu
+        environment: prod
+        region: westeurope
+        fluxNamespace: flux-system
+      - name: staging
+        environment: staging
+        region: eastus
+        fluxNamespace: flux-system
+  - name: reconcileOnDrift
+    type: boolean
+    default: true
+  - name: driftThresholdResources
+    type: number
+    default: 3
+
+variables:
+  - group: gitops-ops-vars
+  - name: gitopsRepoUrl
+    value: $(Build.Repository.Uri)
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: InstallTools
+    displayName: Install GitOps Tools
+    jobs:
+      - job: Setup
+        steps:
+          - bash: |
+              # Install Flux CLI
+              curl -s https://fluxcd.io/install.sh | sudo bash
+              flux --version
+
+              # Install ArgoCD CLI
+              curl -sSL -o /usr/local/bin/argocd \
+                https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+              chmod +x /usr/local/bin/argocd
+
+              # Install kubeconform for manifest validation
+              curl -L https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz \
+                | tar xz && sudo mv kubeconform /usr/local/bin/
+            displayName: Install tools
+
+  - stage: ValidateGitOpsManifests
+    displayName: Validate GitOps Manifests
+    dependsOn: InstallTools
+    jobs:
+      - job: ValidateManifests
+        steps:
+          - checkout: self
+          - bash: |
+              # Validate all Kubernetes manifests in gitops directory
+              find gitops/ -name "*.yaml" -o -name "*.yml" | xargs \
+                kubeconform \
+                  -schema-location default \
+                  -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+                  -summary \
+                  -verbose 2>&1 | tee validation-report.txt
+
+              if grep -q "not valid" validation-report.txt; then
+                echo "##vso[task.logissue type=warning]Some manifests failed validation"
+              fi
+            displayName: Validate manifest schemas
+
+          # OPA Gatekeeper policy evaluation
+          - bash: |
+              if command -v opa &>/dev/null; then
+                find gitops/ -name "*.yaml" | while read manifest; do
+                  opa eval \
+                    --data gitops/policies/ \
+                    --input "$manifest" \
+                    'data.kubernetes.admission.deny[msg]' 2>/dev/null && echo "Policy OK: $manifest" || true
+                done
+              fi
+            displayName: OPA policy evaluation
+
+  - stage: DriftDetection
+    displayName: Detect Drift Between Git and Cluster State
+    dependsOn: ValidateGitOpsManifests
+    jobs:
+      - ${{ each cluster in parameters.clusters }}:
+        - job: Drift_${{ replace(cluster.name, '-', '_') }}
+          displayName: Detect drift in ${{ cluster.name }}
+          steps:
+            - checkout: self
+
+            - task: AzureCLI@2
+              displayName: Get AKS credentials (${{ cluster.name }})
+              inputs:
+                azureSubscription: sc-azure-${{ cluster.environment }}
+                scriptType: bash
+                scriptLocation: inlineScript
+                inlineScript: |
+                  az aks get-credentials \
+                    --resource-group rg-aks-${{ cluster.region }}-${{ cluster.environment }} \
+                    --name aks-${{ cluster.name }} \
+                    --overwrite-existing
+
+            - bash: |
+                # Check Flux reconciliation status
+                echo "=== Flux Sources ==="
+                flux get sources all -n ${{ cluster.fluxNamespace }} 2>/dev/null || echo "Flux not found"
+
+                echo ""
+                echo "=== Flux Kustomizations ==="
+                flux get kustomizations --all-namespaces 2>/dev/null || echo ""
+
+                echo ""
+                echo "=== Failed Kustomizations ==="
+                FAILING=$(flux get kustomizations --all-namespaces \
+                  --status-selector ready=False 2>/dev/null | tee failing.txt | wc -l)
+                echo "Failing: $FAILING"
+                echo "##vso[task.setvariable variable=failingKustomizations_${{ replace(cluster.name, '-', '_') }};isOutput=true]$FAILING"
+              name: fluxStatus_${{ replace(cluster.name, '-', '_') }}
+              displayName: Check Flux status
+              env:
+                KUBECONFIG: ~/.kube/config
+
+            - bash: |
+                # Compare deployed image tags with git-tracked values
+                python3 - <<'PYEOF'
+                import subprocess, yaml, glob, os, sys
+
+                drifted = []
+                for manifest_file in glob.glob("gitops/clusters/${{ cluster.name }}/**/*.yaml", recursive=True):
+                    with open(manifest_file) as f:
+                        try:
+                            docs = list(yaml.safe_load_all(f))
+                        except:
+                            continue
+                    for doc in docs:
+                        if not doc or doc.get("kind") not in ("Deployment", "StatefulSet", "DaemonSet"):
+                            continue
+                        name = doc["metadata"]["name"]
+                        ns = doc["metadata"].get("namespace", "default")
+                        containers = doc.get("spec", {}).get("template", {}).get("spec", {}).get("containers", [])
+                        for c in containers:
+                            git_image = c.get("image", "")
+                            result = subprocess.run(
+                                ["kubectl", "get", doc["kind"].lower(), name, "-n", ns,
+                                 "-o", f"jsonpath={{.spec.template.spec.containers[?(@.name=='{c.get('name','')}}')].image}}"],
+                                capture_output=True, text=True
+                            )
+                            cluster_image = result.stdout.strip()
+                            if cluster_image and git_image and cluster_image != git_image:
+                                drifted.append(f"{ns}/{name}: git={git_image} cluster={cluster_image}")
+
+                if drifted:
+                    print(f"DRIFT DETECTED in ${{ cluster.name }}:")
+                    for d in drifted:
+                        print(f"  - {d}")
+                    sys.exit(1)
+                else:
+                    print("No drift detected in ${{ cluster.name }}")
+                PYEOF
+              displayName: Compare image drift
+              continueOnError: true
+
+  - stage: Reconcile
+    displayName: Force GitOps Reconciliation
+    dependsOn: DriftDetection
+    condition: and(always(), eq('${{ parameters.reconcileOnDrift }}', 'true'))
+    jobs:
+      - ${{ each cluster in parameters.clusters }}:
+        - job: Reconcile_${{ replace(cluster.name, '-', '_') }}
+          displayName: Reconcile ${{ cluster.name }}
+          condition: |
+            or(
+              failed('DriftDetection'),
+              gt(dependencies.DriftDetection.result, 0)
+            )
+          steps:
+            - task: AzureCLI@2
+              displayName: Get credentials
+              inputs:
+                azureSubscription: sc-azure-${{ cluster.environment }}
+                scriptType: bash
+                scriptLocation: inlineScript
+                inlineScript: |
+                  az aks get-credentials \
+                    --resource-group rg-aks-${{ cluster.region }}-${{ cluster.environment }} \
+                    --name aks-${{ cluster.name }} \
+                    --overwrite-existing
+
+            - bash: |
+                echo "Forcing reconciliation on ${{ cluster.name }}"
+                # Force Flux reconciliation
+                flux reconcile source git flux-system -n ${{ cluster.fluxNamespace }}
+                flux reconcile kustomization --all-namespaces
+                echo "Reconciliation triggered"
+              displayName: Force Flux reconcile
+
+  - stage: NotifyDriftAlert
+    displayName: Alert on Drift
+    dependsOn: DriftDetection
+    condition: failed('DriftDetection')
+    jobs:
+      - job: SendAlert
+        steps:
+          - bash: |
+              curl -sf -X POST "$(teamsWebhook)" \
+                -H "Content-Type: application/json" \
+                -d "{
+                  \"type\": \"AdaptiveCard\",
+                  \"version\": \"1.4\",
+                  \"body\": [
+                    {\"type\":\"TextBlock\",\"text\":\"⚠️ GitOps Drift Detected\",\"color\":\"Warning\",\"weight\":\"Bolder\",\"size\":\"Large\"},
+                    {\"type\":\"TextBlock\",\"text\":\"One or more clusters have drifted from GitOps declared state.\",\"wrap\":true},
+                    {\"type\":\"FactSet\",\"facts\":[
+                      {\"title\":\"Build\",\"value\":\"$(Build.BuildId)\"},
+                      {\"title\":\"Branch\",\"value\":\"$(Build.SourceBranchName)\"},
+                      {\"title\":\"Triggered by\",\"value\":\"$(Build.Reason)\"},
+                      {\"title\":\"Time\",\"value\":\"$(date -u)\"}
+                    ]}
+                  ],
+                  \"actions\":[{\"type\":\"Action.OpenUrl\",\"title\":\"View Build\",\"url\":\"$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)\"}]
+                }"
+            displayName: Send drift alert

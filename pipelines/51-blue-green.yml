@@ -1,0 +1,148 @@
+# ============================================================
+# Pipeline 51: Blue-Green Deployment
+# Complexity: Complex
+# Concepts: blue-green traffic switching, AKS service patch,
+#           readiness checks, auto-rollback on failure,
+#           production traffic validation
+# ============================================================
+
+trigger:
+  branches:
+    include: [main]
+
+variables:
+  containerRegistry: myacr.azurecr.io
+  imageRepository: myapp/api
+  imageTag: $(Build.BuildId)
+  k8sNamespace: myapp-prod
+  aksServiceConnection: sc-aks-prod
+  blueLabel: blue
+  greenLabel: green
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: Build
+    jobs:
+      - job: BuildImage
+        steps:
+          - checkout: self
+          - task: Docker@2
+            inputs:
+              command: buildAndPush
+              repository: $(containerRegistry)/$(imageRepository)
+              containerRegistry: sc-acr
+              tags: $(imageTag)
+
+  - stage: DeployGreen
+    displayName: Deploy Green (new version)
+    dependsOn: Build
+    jobs:
+      - deployment: GreenDeploy
+        environment: production/myapp-prod
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                # Deploy new version to green deployment (isolated, no traffic yet)
+                - task: KubernetesManifest@1
+                  displayName: Deploy green workload
+                  inputs:
+                    action: deploy
+                    kubernetesServiceConnection: $(aksServiceConnection)
+                    namespace: $(k8sNamespace)
+                    manifests: k8s/deployment-green.yml
+                    containers: $(containerRegistry)/$(imageRepository):$(imageTag)
+
+                # Wait for green pods to be healthy
+                - task: Kubernetes@1
+                  displayName: Wait for green rollout
+                  inputs:
+                    kubernetesServiceEndpoint: $(aksServiceConnection)
+                    namespace: $(k8sNamespace)
+                    command: rollout
+                    arguments: status deployment/myapp-api-green --timeout=5m
+
+                # Run integration tests against green (not yet live)
+                - bash: |
+                    GREEN_IP=$(kubectl get svc myapp-api-green-internal \
+                      -n $(k8sNamespace) \
+                      -o jsonpath='{.spec.clusterIP}')
+                    echo "Testing green at: $GREEN_IP"
+                    STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://${GREEN_IP}/health")
+                    echo "Green health: $STATUS"
+                    [ "$STATUS" = "200" ]
+                  displayName: Validate green deployment
+                  env:
+                    KUBECONFIG: $(KUBECONFIG)
+
+  - stage: SwitchTraffic
+    displayName: Switch Traffic to Green
+    dependsOn: DeployGreen
+    jobs:
+      - deployment: Switch
+        environment: production
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                # Patch the production service selector from blue to green
+                - task: Kubernetes@1
+                  displayName: Switch production service to green
+                  inputs:
+                    kubernetesServiceEndpoint: $(aksServiceConnection)
+                    namespace: $(k8sNamespace)
+                    command: patch
+                    arguments: |
+                      service myapp-api
+                      -p '{"spec":{"selector":{"slot":"green","app":"myapp-api"}}}'
+
+                # Verify production traffic hits green
+                - bash: |
+                    PROD_URL="https://myapp.company.com/health"
+                    for i in $(seq 1 10); do
+                      STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$PROD_URL")
+                      echo "Attempt $i: $STATUS"
+                      [ "$STATUS" = "200" ] && break || sleep 3
+                    done
+                    [ "$STATUS" = "200" ] || { echo "Traffic switch failed"; exit 1; }
+                  displayName: Verify live traffic on green
+
+  - stage: Cleanup
+    displayName: Cleanup Blue Deployment
+    dependsOn: SwitchTraffic
+    jobs:
+      - job: RemoveBlue
+        pool: {vmImage: ubuntu-latest}
+        steps:
+          - task: Kubernetes@1
+            displayName: Scale down blue deployment
+            inputs:
+              kubernetesServiceEndpoint: $(aksServiceConnection)
+              namespace: $(k8sNamespace)
+              command: scale
+              arguments: deployment/myapp-api-blue --replicas=0
+
+  - stage: Rollback
+    displayName: Rollback to Blue (if green failed)
+    dependsOn: SwitchTraffic
+    condition: failed('SwitchTraffic')
+    jobs:
+      - job: RollbackToBlue
+        pool: {vmImage: ubuntu-latest}
+        steps:
+          - task: Kubernetes@1
+            displayName: Restore traffic to blue
+            inputs:
+              kubernetesServiceEndpoint: $(aksServiceConnection)
+              namespace: $(k8sNamespace)
+              command: patch
+              arguments: |
+                service myapp-api
+                -p '{"spec":{"selector":{"slot":"blue","app":"myapp-api"}}}'
+          - bash: echo "Rolled back to blue slot!"
+            displayName: Rollback complete

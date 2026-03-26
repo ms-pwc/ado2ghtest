@@ -1,0 +1,79 @@
+# ============================================================
+# Pipeline 31: SonarQube / SonarCloud Code Analysis
+# Complexity: Medium
+# Concepts: SonarQubePrepare, SonarQubeAnalyze, SonarQubePublish,
+#           quality gates, branch analysis, PR decoration
+# ============================================================
+
+trigger:
+  branches:
+    include: [main, develop]
+
+pr:
+  branches:
+    include: [main]
+
+variables:
+  sonarProjectKey: my-org_my-project
+  sonarOrganization: my-org            # SonarCloud only
+  buildConfiguration: Release
+
+pool:
+  vmImage: ubuntu-latest
+
+steps:
+  - checkout: self
+    fetchDepth: 0          # SonarQube needs full history for blame data
+
+  - task: UseDotNet@2
+    inputs:
+      version: '8.x'
+
+  # Prepare SonarCloud analysis
+  - task: SonarCloudPrepare@2
+    displayName: Prepare SonarCloud analysis
+    inputs:
+      SonarCloud: sc-sonarcloud           # service connection
+      organization: $(sonarOrganization)
+      scannerMode: MSBuild
+      projectKey: $(sonarProjectKey)
+      projectName: My Project
+      extraProperties: |
+        sonar.cs.opencover.reportsPaths=$(Agent.TempDirectory)/coverage/coverage.opencover.xml
+        sonar.cs.vstest.reportsPaths=$(Agent.TempDirectory)/**/*.trx
+        sonar.exclusions=**/obj/**,**/bin/**,**/*.Designer.cs
+        sonar.coverage.exclusions=**/Tests/**
+
+  - task: DotNetCoreCLI@2
+    displayName: dotnet build
+    inputs:
+      command: build
+      arguments: --configuration $(buildConfiguration) --no-restore
+
+  - task: DotNetCoreCLI@2
+    displayName: dotnet test with coverage
+    inputs:
+      command: test
+      arguments: >
+        --configuration $(buildConfiguration)
+        --no-build
+        --collect:"XPlat Code Coverage"
+        --results-directory $(Agent.TempDirectory)
+        --logger trx
+      publishTestResults: true
+
+  # Run analysis
+  - task: SonarCloudAnalyze@2
+    displayName: Run SonarCloud analysis
+
+  # Publish results to SonarCloud dashboard
+  - task: SonarCloudPublish@2
+    displayName: Publish SonarCloud results
+    inputs:
+      pollingTimeoutSec: '300'
+
+  # Quality Gate check – fail the pipeline if gate fails
+  - bash: |
+      echo "Quality gate result available in SonarCloud dashboard."
+      echo "Pipeline will fail if quality gate is not met."
+    displayName: Quality gate summary

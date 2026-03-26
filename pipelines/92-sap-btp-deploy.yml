@@ -1,0 +1,227 @@
+# ============================================================
+# Pipeline 92: SAP BTP Integration Pipeline
+# Complexity: Highly Complex
+# Concepts: SAP BTP deployment, Cloud Foundry CLI (cf),
+#           mtar build with MTA Build Tool (mbt),
+#           SAP Integration Suite iFlow deployment,
+#           service instance binding, BTP subaccount management,
+#           destination configuration, Kyma deploy
+# ============================================================
+
+trigger:
+  branches:
+    include: [main]
+  paths:
+    include: [src/*, mta.yaml, integration-flows/**]
+
+parameters:
+  - name: environment
+    type: string
+    default: test
+    values: [dev, test, prod]
+  - name: deployIntegrationFlows
+    type: boolean
+    default: true
+  - name: deployKyma
+    type: boolean
+    default: false
+
+variables:
+  - group: sap-btp-${{ parameters.environment }}-vars
+  - name: cfApiEndpoint
+    value: https://api.cf.$(sapRegion).hana.ondemand.com
+  - name: cfOrg
+    value: $(sapOrg)
+  - name: cfSpace
+    value: ${{ parameters.environment }}
+  - name: mtarArtifact
+    value: $(Build.ArtifactStagingDirectory)/myapp.mtar
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: BuildMTA
+    displayName: Build Multi-Target Application (MTA)
+    jobs:
+      - job: BuildMTAR
+        steps:
+          - checkout: self
+
+          - bash: |
+              # Install MTA Build Tool
+              NPM_VERSION=$(npm -v)
+              echo "npm: $NPM_VERSION"
+              npm install -g mbt
+              mbt --version
+            displayName: Install MBT
+
+          - bash: |
+              node --version && npm --version
+              # Install dependencies for each module
+              for module in $(yq '.modules[].path' mta.yaml); do
+                if [ -f "$module/package.json" ]; then
+                  echo "Installing: $module"
+                  cd "$module" && npm ci && cd ..
+                fi
+              done
+            displayName: Install module dependencies
+
+          - bash: |
+              mbt build \
+                --mtar $(mtarArtifact) \
+                --platform CF \
+                --strict
+            displayName: Build MTAR
+
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: $(Build.ArtifactStagingDirectory)
+              artifactName: mtar
+
+  - stage: DeployBTP
+    displayName: Deploy to SAP BTP / Cloud Foundry
+    dependsOn: BuildMTA
+    jobs:
+      - deployment: CFDeploy
+        environment: sap-btp-${{ parameters.environment }}
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: DownloadPipelineArtifact@2
+                  inputs:
+                    artifactName: mtar
+                    targetPath: $(Pipeline.Workspace)/mtar
+
+                - bash: |
+                    # Install CF CLI v8
+                    curl -L "https://packages.cloudfoundry.org/stable?release=linux64-binary&version=v8" | tar -xz
+                    sudo mv cf8 /usr/local/bin/cf
+                    cf version
+
+                    # Install MTA CF plugin
+                    cf install-plugin multiapps -f
+                  displayName: Install CF CLI
+
+                - bash: |
+                    # Authenticate to Cloud Foundry
+                    cf api $(cfApiEndpoint)
+                    cf auth "$(sapCFUser)" "$(sapCFPassword)"
+                    cf target -o $(cfOrg) -s $(cfSpace)
+                    cf apps
+                  displayName: CF Login and target
+
+                - bash: |
+                    # Deploy MTAR with MTA plugin
+                    cf deploy "$(Pipeline.Workspace)/mtar/myapp.mtar" \
+                      --strategy rolling \
+                      -f \
+                      --version-rule ALL
+
+                    echo "MTA deployment triggered"
+                  displayName: CF MTA deploy
+
+                - bash: |
+                    # Monitor deployment status
+                    MAX_WAIT=30
+                    for i in $(seq 1 $MAX_WAIT); do
+                      STATUS=$(cf mta myapp --json 2>/dev/null | python3 -c "
+                  import json, sys
+                  d = json.load(sys.stdin)
+                  print(d.get('state', 'UNKNOWN'))
+                  " || echo "UNKNOWN")
+                      echo "MTA state: $STATUS  (attempt $i/$MAX_WAIT)"
+                      [ "$STATUS" = "DEPLOYED" ] && { echo "Deploy OK"; exit 0; }
+                      [ "$STATUS" = "INVALID" ] && { echo "##vso[task.logissue type=error]Deploy FAILED"; exit 1; }
+                      sleep 30
+                    done
+                    echo "##vso[task.logissue type=warning]Timed out waiting for MTA"
+                  displayName: Wait for deployment
+
+                - bash: |
+                    # Show deployed apps
+                    cf apps
+                    cf services
+                  displayName: Show deployment status
+
+  - stage: DeployIntegrationFlows
+    displayName: Deploy SAP Integration Suite iFlows
+    dependsOn: DeployBTP
+    condition: and(succeeded(), eq('${{ parameters.deployIntegrationFlows }}', 'true'))
+    jobs:
+      - deployment: iFlowDeploy
+        environment: sap-integration-${{ parameters.environment }}
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - bash: pip install requests
+                - bash: |
+                    python3 - <<'PYEOF'
+                    import os, requests
+
+                    # SAP Cloud Integration REST API
+                    base_url = os.environ["CI_BASE_URL"]
+                    user = os.environ["CI_USER"]
+                    password = os.environ["CI_PASSWORD"]
+
+                    session = requests.Session()
+                    session.auth = (user, password)
+
+                    import os, glob
+                    iflow_dir = "integration-flows"
+                    for iflow_file in glob.glob(f"{iflow_dir}/*.zip"):
+                        iflow_name = os.path.basename(iflow_file).replace(".zip", "")
+                        print(f"Deploying iFlow: {iflow_name}")
+
+                        # Upload artifact
+                        with open(iflow_file, "rb") as f:
+                            resp = session.post(
+                                f"{base_url}/api/v1/IntegrationPackages/{os.environ['PACKAGE_ID']}/IntegrationDesigntimeArtifacts",
+                                files={"file": f}
+                            )
+                        resp.raise_for_status()
+
+                        # Deploy
+                        deploy_resp = session.post(
+                            f"{base_url}/api/v1/DeployIntegrationDesigntimeArtifact",
+                            params={"Id": f"'{iflow_name}'", "Version": "'active'"}
+                        )
+                        print(f"Deploy response: {deploy_resp.status_code}")
+                    PYEOF
+                  displayName: Deploy integration flows
+                  env:
+                    CI_BASE_URL: $(integrationBaseUrl)
+                    CI_USER: $(integrationUser)
+                    CI_PASSWORD: $(integrationPassword)
+                    PACKAGE_ID: $(integrationPackageId)
+
+  - stage: PostDeployValidation
+    displayName: Validate SAP BTP Deployment
+    dependsOn:
+      - DeployBTP
+      - DeployIntegrationFlows
+    condition: succeeded()
+    jobs:
+      - job: Validate
+        steps:
+          - bash: |
+              # Install CF CLI for validation
+              curl -L "https://packages.cloudfoundry.org/stable?release=linux64-binary&version=v8" | tar -xz
+              sudo mv cf8 /usr/local/bin/cf
+              cf api $(cfApiEndpoint)
+              cf auth "$(sapCFUser)" "$(sapCFPassword)"
+              cf target -o $(cfOrg) -s $(cfSpace)
+
+              # Check all apps are running
+              STOPPED=$(cf apps | grep "stopped\|crashed" | wc -l)
+              echo "Apps not running: $STOPPED"
+              if [ "$STOPPED" -gt "0" ]; then
+                echo "##vso[task.logissue type=error]$STOPPED app(s) are not running!"
+                cf apps
+                exit 1
+              fi
+              echo "All apps healthy"

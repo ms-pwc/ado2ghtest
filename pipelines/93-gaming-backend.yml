@@ -1,0 +1,257 @@
+# ============================================================
+# Pipeline 93: Gaming Backend – Playfab + Unity Build
+# Complexity: Highly Complex
+# Concepts: Unity Cloud Build alternative via CLI, GameCI,
+#           PlayFab catalog & economy API deploy, Addressables
+#           content update, CDN asset push, game server Fleet
+#           deploy (Agones/PlayFab Multiplayer), hotfix cert,
+#           A/B test configuration via Remote Config
+# ============================================================
+
+trigger:
+  branches:
+    include: [main, release/game-*]
+  paths:
+    include: [Assets/**, GameServer/**, PlayFabData/**, UnityProject/**]
+
+parameters:
+  - name: buildTargets
+    type: object
+    default:
+      - platform: StandaloneWindows64
+        short: win64
+      - platform: Android
+        short: android
+      - platform: iOS
+        short: ios
+  - name: environment
+    type: string
+    default: staging
+    values: [dev, staging, prod]
+  - name: deployGameServer
+    type: boolean
+    default: true
+  - name: updateAddressables
+    type: boolean
+    default: true
+
+variables:
+  - group: gaming-${{ parameters.environment }}-vars
+  - name: buildVersion
+    value: 1.0.$(Build.BuildId)
+  - name: unityVersion
+    value: 2022.3.20f1
+  - name: playfabTitle
+    value: $(playfabTitleId)
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: ValidateAndTest
+    displayName: Validate Assets & Unit Tests
+    jobs:
+      - job: ValidateUnity
+        container:
+          image: unityci/editor:$(unityVersion)-base-3
+          options: '--env UNITY_LICENSE=$(unityLicense)'
+        steps:
+          - checkout: self
+
+          - bash: |
+              unity-editor -batchmode -nographics \
+                -projectPath UnityProject \
+                -runTests \
+                -testPlatform EditMode \
+                -testResults /tmp/editmode-results.xml \
+                -logFile /tmp/unity-edit-tests.log \
+                -quit
+            displayName: Run Unity Edit Mode tests
+
+          - bash: |
+              unity-editor -batchmode -nographics \
+                -projectPath UnityProject \
+                -runTests \
+                -testPlatform PlayMode \
+                -testResults /tmp/playmode-results.xml \
+                -logFile /tmp/unity-play-tests.log \
+                -quit
+            displayName: Run Unity Play Mode tests
+
+          - task: PublishTestResults@2
+            condition: always()
+            inputs:
+              testResultsFormat: NUnit
+              testResultsFiles: '/tmp/*-results.xml'
+              testRunTitle: Unity Tests
+
+  - stage: BuildGame
+    displayName: Build Game Targets
+    dependsOn: ValidateAndTest
+    jobs:
+      - ${{ each target in parameters.buildTargets }}:
+        - job: Build_${{ target.short }}
+          displayName: Build ${{ target.platform }}
+          timeoutInMinutes: 90
+          ${{ if eq(target.platform, 'iOS') }}:
+            pool: { vmImage: macos-latest }
+          container:
+            ${{ if ne(target.platform, 'iOS') }}:
+              image: unityci/editor:$(unityVersion)-${{ lower(target.platform) }}-3
+              options: '--env UNITY_LICENSE=$(unityLicense)'
+          steps:
+            - checkout: self
+
+            - bash: |
+                unity-editor -batchmode -nographics \
+                  -projectPath UnityProject \
+                  -buildTarget ${{ target.platform }} \
+                  -executeMethod BuildScript.PerformBuild \
+                  -buildVersion $(buildVersion) \
+                  -outputPath $(Build.ArtifactStagingDirectory)/builds/${{ target.short }} \
+                  -logFile /tmp/unity-build-${{ target.short }}.log \
+                  -quit
+
+                echo "Build complete for ${{ target.platform }}"
+              displayName: Build ${{ target.platform }}
+
+            - task: PublishPipelineArtifact@1
+              inputs:
+                targetPath: $(Build.ArtifactStagingDirectory)/builds/${{ target.short }}
+                artifactName: game-build-${{ target.short }}
+
+  - stage: UpdateAddressables
+    displayName: Build & Upload Addressables Content
+    dependsOn: ValidateAndTest
+    condition: and(succeeded(), eq('${{ parameters.updateAddressables }}', 'true'))
+    jobs:
+      - job: AddressableBuild
+        container:
+          image: unityci/editor:$(unityVersion)-base-3
+          options: '--env UNITY_LICENSE=$(unityLicense)'
+        steps:
+          - checkout: self
+
+          - bash: |
+              unity-editor -batchmode -nographics \
+                -projectPath UnityProject \
+                -executeMethod AddressablesBuilder.BuildAddressables \
+                -logFile /tmp/addressables-build.log \
+                -quit
+
+              ls -la UnityProject/ServerData/
+            displayName: Build Addressables
+
+          - task: AzureCLI@2
+            displayName: Upload to Azure CDN storage
+            inputs:
+              azureSubscription: sc-azure-${{ parameters.environment }}
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az storage blob upload-batch \
+                  --account-name $(storageAccount) \
+                  --destination '$web/addressables/$(buildVersion)' \
+                  --source UnityProject/ServerData \
+                  --overwrite
+
+                # Purge CDN
+                az cdn endpoint purge \
+                  --resource-group $(rgName) \
+                  --profile-name $(cdnProfile) \
+                  --name $(cdnEndpoint) \
+                  --content-paths '/addressables/*'
+
+  - stage: UpdatePlayFab
+    displayName: Update PlayFab Backend Data
+    dependsOn: BuildGame
+    jobs:
+      - deployment: PlayFabDeploy
+        environment: ${{ parameters.environment }}-playfab
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - bash: npm install -g playfab-cli
+                  displayName: Install PlayFab CLI
+
+                - bash: |
+                    # Deploy economy catalog items
+                    playfab catalog deploy \
+                      --titleId $(playfabTitle) \
+                      --secretKey $(playfabSecret) \
+                      --catalogFile PlayFabData/catalog.json
+                  displayName: Deploy catalog
+
+                - bash: |
+                    # Upload Cloud Script functions
+                    playfab cloudscript upload \
+                      --titleId $(playfabTitle) \
+                      --secretKey $(playfabSecret) \
+                      --scriptFile PlayFabData/CloudScript.js
+                  displayName: Upload Cloud Script
+
+                - bash: |
+                    # Update Remote Config (A/B test values)
+                    python3 - <<'PYEOF'
+                    import requests, json, os
+
+                    title = os.environ["PLAYFAB_TITLE"]
+                    secret = os.environ["PLAYFAB_SECRET"]
+                    env = "${{ parameters.environment }}"
+
+                    # Load environment-specific config
+                    with open(f"PlayFabData/remote-config-{env}.json") as f:
+                        config = json.load(f)
+
+                    url = f"https://{title}.playfabapi.com/Admin/UpdateTitleData"
+                    headers = {"X-SecretKey": secret, "Content-Type": "application/json"}
+                    resp = requests.post(url, json={"KeyValueData": config}, headers=headers)
+                    resp.raise_for_status()
+                    print(f"Remote config updated: {resp.json()}")
+                    PYEOF
+                  displayName: Update Remote Config
+                  env:
+                    PLAYFAB_TITLE: $(playfabTitle)
+                    PLAYFAB_SECRET: $(playfabSecret)
+
+  - stage: DeployGameServer
+    displayName: Deploy Game Server Fleet
+    dependsOn: BuildGame
+    condition: and(succeeded(), eq('${{ parameters.deployGameServer }}', 'true'))
+    jobs:
+      - deployment: GameServerDeploy
+        environment: ${{ parameters.environment }}-gameserver
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: Docker@2
+                  displayName: Build & Push game server image
+                  inputs:
+                    command: buildAndPush
+                    repository: $(acrName).azurecr.io/gameserver
+                    containerRegistry: sc-acr
+                    dockerfile: GameServer/Dockerfile
+                    tags: $(buildVersion)
+
+                - task: KubernetesManifest@1
+                  displayName: Deploy Agones Fleet
+                  inputs:
+                    action: deploy
+                    kubernetesServiceConnection: sc-aks-gameservers
+                    namespace: game-servers
+                    manifests: GameServer/k8s/fleet.yml
+                    containers: $(acrName).azurecr.io/gameserver:$(buildVersion)
+
+                - task: Kubernetes@1
+                  displayName: Check fleet status
+                  inputs:
+                    kubernetesServiceEndpoint: sc-aks-gameservers
+                    namespace: game-servers
+                    command: get
+                    arguments: fleet -o wide

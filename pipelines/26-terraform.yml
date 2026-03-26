@@ -1,0 +1,152 @@
+# ============================================================
+# Pipeline 26: Terraform – Init, Plan, Apply
+# Complexity: Medium
+# Concepts: TerraformInstaller, TerraformTaskV4, remote state,
+#           plan file artifact, workspace, var-files
+# ============================================================
+
+trigger:
+  branches:
+    include: [main]
+  paths:
+    include: [terraform/**]
+
+variables:
+  terraformVersion: '1.7.5'
+  tfWorkingDir: terraform
+  backendResourceGroup: rg-tfstate
+  backendStorageAccount: mystorageacctfstate
+  backendContainer: tfstate
+  backendKey: myapp.terraform.tfstate
+  azureServiceConnection: sc-azure-prod
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: TerraformPlan
+    displayName: Terraform Plan
+    jobs:
+      - job: Plan
+        steps:
+          - checkout: self
+
+          # Install Terraform
+          - task: TerraformInstaller@1
+            displayName: Install Terraform $(terraformVersion)
+            inputs:
+              terraformVersion: $(terraformVersion)
+
+          # terraform init with remote backend
+          - task: TerraformTaskV4@4
+            displayName: terraform init
+            inputs:
+              provider: azurerm
+              command: init
+              workingDirectory: $(tfWorkingDir)
+              backendServiceArm: $(azureServiceConnection)
+              backendAzureRmResourceGroupName: $(backendResourceGroup)
+              backendAzureRmStorageAccountName: $(backendStorageAccount)
+              backendAzureRmContainerName: $(backendContainer)
+              backendAzureRmKey: $(backendKey)
+
+          # terraform validate
+          - task: TerraformTaskV4@4
+            displayName: terraform validate
+            inputs:
+              provider: azurerm
+              command: validate
+              workingDirectory: $(tfWorkingDir)
+
+          # terraform plan – save to artifact
+          - task: TerraformTaskV4@4
+            displayName: terraform plan
+            inputs:
+              provider: azurerm
+              command: plan
+              workingDirectory: $(tfWorkingDir)
+              commandOptions: >
+                -var-file="environments/prod.tfvars"
+                -out="$(Agent.TempDirectory)/tfplan"
+                -detailed-exitcode
+              environmentServiceNameAzureRM: $(azureServiceConnection)
+
+          # Publish plan file
+          - task: PublishPipelineArtifact@1
+            displayName: Publish plan file
+            inputs:
+              targetPath: $(Agent.TempDirectory)/tfplan
+              artifact: terraform-plan
+
+  - stage: TerraformApply
+    displayName: Terraform Apply
+    dependsOn: TerraformPlan
+    condition: |
+      and(
+        succeeded('TerraformPlan'),
+        eq(variables['Build.SourceBranchName'], 'main')
+      )
+    jobs:
+      - deployment: Apply
+        displayName: Apply Terraform changes
+        environment: production           # approval gate
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: TerraformInstaller@1
+                  displayName: Install Terraform
+                  inputs:
+                    terraformVersion: $(terraformVersion)
+
+                - task: TerraformTaskV4@4
+                  displayName: terraform init (apply stage)
+                  inputs:
+                    provider: azurerm
+                    command: init
+                    workingDirectory: $(tfWorkingDir)
+                    backendServiceArm: $(azureServiceConnection)
+                    backendAzureRmResourceGroupName: $(backendResourceGroup)
+                    backendAzureRmStorageAccountName: $(backendStorageAccount)
+                    backendAzureRmContainerName: $(backendContainer)
+                    backendAzureRmKey: $(backendKey)
+
+                # Download plan artifact
+                - download: current
+                  artifact: terraform-plan
+
+                - task: TerraformTaskV4@4
+                  displayName: terraform apply
+                  inputs:
+                    provider: azurerm
+                    command: apply
+                    workingDirectory: $(tfWorkingDir)
+                    commandOptions: $(Pipeline.Workspace)/terraform-plan/tfplan
+                    environmentServiceNameAzureRM: $(azureServiceConnection)
+
+  - stage: TerraformDestroy
+    displayName: Terraform Destroy (manual only)
+    dependsOn: []
+    condition: false          # never auto-runs; queue manually to destroy
+    jobs:
+      - deployment: Destroy
+        environment: production
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - task: TerraformInstaller@1
+                  inputs:
+                    terraformVersion: $(terraformVersion)
+                - task: TerraformTaskV4@4
+                  displayName: terraform destroy
+                  inputs:
+                    provider: azurerm
+                    command: destroy
+                    workingDirectory: $(tfWorkingDir)
+                    commandOptions: -var-file="environments/prod.tfvars" -auto-approve
+                    environmentServiceNameAzureRM: $(azureServiceConnection)

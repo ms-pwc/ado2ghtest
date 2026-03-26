@@ -1,0 +1,282 @@
+# ============================================================
+# Pipeline 98: Enterprise GitFlow Release Automation
+# Complexity: Highly Complex
+# Concepts: GitFlow branching strategy automation, automated
+#           release branch creation, changelog generation,
+#           version bumping, hotfix merge back, PR creation,
+#           release notes, Jira/ADO work item linking,
+#           auto-tag, NPM/NuGet/PyPI publishing
+# ============================================================
+
+trigger:
+  branches:
+    include: [release/*, hotfix/*]
+  tags:
+    include: ['v*.*.*']
+
+pr: none
+
+parameters:
+  - name: releaseType
+    type: string
+    default: minor
+    values: [major, minor, patch, hotfix]
+    displayName: 'Semver bump type'
+  - name: publishComponents
+    type: object
+    default:
+      npm: true
+      nuget: true
+      pypi: false
+      docker: true
+  - name: createGitHubRelease
+    type: boolean
+    default: true
+  - name: jiraProject
+    type: string
+    default: PROJ
+    displayName: Jira project key for release notes
+
+variables:
+  - group: release-automation-vars
+  - name: currentVersion
+    value: ''   # Will be populated from version file
+  - name: newVersion
+    value: ''   # Will be calculated
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: PrepareRelease
+    displayName: Prepare Release
+    jobs:
+      - job: CalculateVersion
+        steps:
+          - checkout: self
+            persistCredentials: true
+            fetchDepth: 0
+
+          - bash: |
+              # Install GitVersion or use manual bump
+              npm install -g semver conventional-changelog-cli
+
+              # Read current version
+              if [ -f "version.txt" ]; then
+                CURRENT=$(cat version.txt)
+              elif [ -f "package.json" ]; then
+                CURRENT=$(jq -r '.version' package.json)
+              else
+                CURRENT="0.0.0"
+              fi
+              echo "Current version: $CURRENT"
+
+              # Calculate new version
+              case "${{ parameters.releaseType }}" in
+                major) NEW=$(semver -i major $CURRENT) ;;
+                minor) NEW=$(semver -i minor $CURRENT) ;;
+                patch) NEW=$(semver -i patch $CURRENT) ;;
+                hotfix) NEW=$(semver -i patch $CURRENT) ;;
+              esac
+
+              echo "New version: $NEW"
+              echo "##vso[task.setvariable variable=currentVersion;isOutput=true]$CURRENT"
+              echo "##vso[task.setvariable variable=newVersion;isOutput=true]$NEW"
+              echo "$NEW" > version.txt
+            name: calcVersion
+            displayName: Calculate new version
+
+          - bash: |
+              # Update version in all project files
+              NEW_VERSION=$(calcVersion.newVersion)
+
+              # package.json
+              [ -f package.json ] && jq ".version = \"$NEW_VERSION\"" package.json > tmpfile && mv tmpfile package.json
+
+              # .csproj files
+              find . -name "*.csproj" -exec sed -i "s|<Version>[^<]*</Version>|<Version>$NEW_VERSION</Version>|g" {} \;
+
+              # pyproject.toml
+              [ -f pyproject.toml ] && sed -i "s/^version = .*/version = \"$NEW_VERSION\"/" pyproject.toml
+
+              echo "Version bumped to $NEW_VERSION in all project files"
+            displayName: Bump version in project files
+            env:
+              NEW_VERSION: $(calcVersion.newVersion)
+
+  - stage: GenerateChangelog
+    displayName: Generate Changelog & Release Notes
+    dependsOn: PrepareRelease
+    variables:
+      newVersion: $[ stageDependencies.PrepareRelease.CalculateVersion.outputs['calcVersion.newVersion'] ]
+    jobs:
+      - job: Changelog
+        steps:
+          - checkout: self
+            fetchDepth: 0
+
+          - bash: npm install -g conventional-changelog-cli
+            displayName: Install changelog generator
+
+          - bash: |
+              # Generate changelog from conventional commits
+              conventional-changelog \
+                -p angular \
+                -i CHANGELOG.md \
+                -s \
+                -r 0 || true
+
+              echo "## Release $(newVersion) – $(date +%Y-%m-%d)" > RELEASE_NOTES.md
+              echo "" >> RELEASE_NOTES.md
+              conventional-changelog -p angular -r 1 --no-header >> RELEASE_NOTES.md
+              cat RELEASE_NOTES.md
+            displayName: Generate changelog
+
+          - bash: |
+              # Fetch Jira issues from commit messages
+              JIRA_ISSUES=$(git log \
+                --since="$(git describe --tags --abbrev=0 2>/dev/null || git rev-list --max-parents=0 HEAD)" \
+                --format="%s %b" \
+                | grep -oP '${{ parameters.jiraProject }}-[0-9]+' \
+                | sort -u \
+                | tr '\n' ', ')
+
+              echo "Jira issues in release: $JIRA_ISSUES"
+              echo "##vso[task.setvariable variable=jiraIssues]$JIRA_ISSUES"
+
+              if [ -n "$JIRA_ISSUES" ]; then
+                # Add Jira references to release notes
+                echo "" >> RELEASE_NOTES.md
+                echo "## Work Items" >> RELEASE_NOTES.md
+                for issue in $(echo "$JIRA_ISSUES" | tr ',' '\n'); do
+                  [ -z "$issue" ] && continue
+                  echo "- [$issue](https://$(jiraHost)/browse/$issue)" >> RELEASE_NOTES.md
+                done
+              fi
+            displayName: Extract Jira issues
+
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: RELEASE_NOTES.md
+              artifactName: release-notes
+
+  - stage: BuildRelease
+    displayName: Build Release Artifacts
+    dependsOn: GenerateChangelog
+    variables:
+      newVersion: $[ stageDependencies.PrepareRelease.CalculateVersion.outputs['calcVersion.newVersion'] ]
+    jobs:
+      - job: BuildAll
+        steps:
+          - checkout: self
+
+          # .NET NuGet packages
+          - ${{ if eq(parameters.publishComponents.nuget, true) }}:
+            - bash: |
+                dotnet pack \
+                  -c Release \
+                  -p:PackageVersion=$(newVersion) \
+                  --output $(Build.ArtifactStagingDirectory)/nuget
+              displayName: Pack NuGet packages
+
+          # NPM packages
+          - ${{ if eq(parameters.publishComponents.npm, true) }}:
+            - bash: |
+                npm version $(newVersion) --no-git-tag-version
+                npm pack --pack-destination $(Build.ArtifactStagingDirectory)/npm
+              displayName: Pack NPM
+              workingDirectory: frontend
+
+          # Docker image
+          - ${{ if eq(parameters.publishComponents.docker, true) }}:
+            - task: Docker@2
+              inputs:
+                command: buildAndPush
+                repository: $(containerRegistry)/$(appName)
+                containerRegistry: sc-acr
+                tags: |
+                  $(newVersion)
+                  latest
+
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: $(Build.ArtifactStagingDirectory)
+              artifactName: release-artifacts
+
+  - stage: TagAndPublish
+    displayName: Tag, Commit & Publish
+    dependsOn: BuildRelease
+    variables:
+      newVersion: $[ stageDependencies.PrepareRelease.CalculateVersion.outputs['calcVersion.newVersion'] ]
+    jobs:
+      - deployment: PublishRelease
+        environment: release-management
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                  persistCredentials: true
+                  fetchDepth: 0
+
+                - task: DownloadPipelineArtifact@2
+                  inputs:
+                    pattern: '**'
+                    targetPath: $(Pipeline.Workspace)/artifacts
+
+                # Publish NuGet
+                - ${{ if eq(parameters.publishComponents.nuget, true) }}:
+                  - task: NuGetCommand@2
+                    displayName: Push NuGet to Azure Artifacts
+                    inputs:
+                      command: push
+                      packagesToPush: $(Pipeline.Workspace)/artifacts/release-artifacts/nuget/*.nupkg
+                      nuGetFeedType: internal
+                      publishVstsFeed: $(nugetFeedId)
+
+                # Publish NPM to Azure Artifacts
+                - ${{ if eq(parameters.publishComponents.npm, true) }}:
+                  - bash: |
+                      cd $(Pipeline.Workspace)/artifacts/release-artifacts/npm
+                      npm publish *.tgz \
+                        --registry https://pkgs.dev.azure.com/$(adoOrg)/$(adoProject)/_packaging/$(npmFeed)/npm/registry/ \
+                        --//pkgs.dev.azure.com/$(adoOrg)/$(adoProject)/_packaging/$(npmFeed)/npm/registry/:_authToken=$(System.AccessToken)
+                    displayName: Publish NPM package
+
+                # Git tag and changelog commit
+                - bash: |
+                    git config user.email "release-bot@$(orgDomain)"
+                    git config user.name "Release Bot"
+                    git add -A
+                    git commit -m "chore(release): v$(newVersion) [skip ci]"
+                    git tag "v$(newVersion)" -m "Release $(newVersion)"
+                    git push origin HEAD
+                    git push origin "v$(newVersion)"
+                    echo "Tagged and pushed v$(newVersion)"
+                  displayName: Tag and push
+
+                # Merge release branch back to main and develop (GitFlow)
+                - bash: |
+                    BRANCH=$(Build.SourceBranchName)
+
+                    for target in main develop; do
+                      git fetch origin $target
+                      git checkout $target
+                      git merge --no-ff "origin/$BRANCH" -m "Merge $BRANCH into $target [skip ci]"
+                      git push origin $target
+                      echo "Merged $BRANCH → $target"
+                    done
+                  displayName: Merge release → main & develop
+
+                # Create ADO Release work item links
+                - bash: |
+                    curl -sf -X POST \
+                      -u ":$(System.AccessToken)" \
+                      -H "Content-Type: application/json" \
+                      "$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_apis/wit/workitems/\$Release?api-version=7.1" \
+                      -d "[
+                        {\"op\":\"add\",\"path\":\"/fields/System.Title\",\"value\":\"Release v$(newVersion)\"},
+                        {\"op\":\"add\",\"path\":\"/fields/System.Description\",\"value\":\"Automated release $(newVersion)\"}
+                      ]" | jq '{id: .id, url: .url}'
+                  displayName: Create ADO Release work item

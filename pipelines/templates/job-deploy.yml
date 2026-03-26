@@ -1,0 +1,38 @@
+# ============================================================
+# Job Template: templates/job-deploy.yml
+# Concepts: job template, parameters, deployment steps
+# ============================================================
+
+parameters:
+  - name: environmentName
+    type: string
+
+  - name: serviceConnection
+    type: string
+
+  - name: artifactName
+    type: string
+    default: drop
+
+  - name: extraSteps
+    type: stepList
+    default: []              # caller can inject additional steps
+
+jobs:
+  - job: Deploy_${{ parameters.environmentName }}
+    displayName: Deploy to ${{ parameters.environmentName }}
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+      - download: current
+        artifact: ${{ parameters.artifactName }}
+        displayName: Download artifact
+
+      - script: |
+          echo "Deploying to ${{ parameters.environmentName }}"
+          echo "Using service connection: ${{ parameters.serviceConnection }}"
+        displayName: Deploy
+
+      # Inject caller-supplied steps (stepList parameter)
+      - ${{ each step in parameters.extraSteps }}:
+        - ${{ step }}

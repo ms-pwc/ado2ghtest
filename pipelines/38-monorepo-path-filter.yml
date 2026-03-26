@@ -1,0 +1,150 @@
+# ============================================================
+# Pipeline 38: Monorepo – Path-Filtered Parallel Builds
+# Complexity: Medium-Complex
+# Concepts: path filters per job, changed-files detection,
+#           independent service builds, selective triggers
+# ============================================================
+
+trigger:
+  branches:
+    include: [main, develop]
+  paths:
+    include:
+      - services/**
+      - shared/**
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  buildConfiguration: Release
+
+stages:
+
+  - stage: DetectChanges
+    displayName: Detect Changed Services
+    jobs:
+      - job: Detect
+        steps:
+          - checkout: self
+            fetchDepth: 2    # need previous commit to diff
+
+          - bash: |
+              CHANGED=$(git diff --name-only HEAD~1 HEAD)
+              echo "Changed files:"
+              echo "$CHANGED"
+
+              # Set flags for each service
+              echo "##vso[task.setvariable variable=buildServiceA;isOutput=true]$(echo "$CHANGED" | grep -q 'services/service-a/' && echo true || echo false)"
+              echo "##vso[task.setvariable variable=buildServiceB;isOutput=true]$(echo "$CHANGED" | grep -q 'services/service-b/' && echo true || echo false)"
+              echo "##vso[task.setvariable variable=buildServiceC;isOutput=true]$(echo "$CHANGED" | grep -q 'services/service-c/' && echo true || echo false)"
+              echo "##vso[task.setvariable variable=buildShared;isOutput=true]$(echo "$CHANGED"   | grep -q 'shared/' && echo true || echo false)"
+            name: changes
+            displayName: Detect changed services
+
+  - stage: BuildServices
+    displayName: Build Changed Services
+    dependsOn: DetectChanges
+    variables:
+      buildServiceA: $[ stageDependencies.DetectChanges.Detect.outputs['changes.buildServiceA'] ]
+      buildServiceB: $[ stageDependencies.DetectChanges.Detect.outputs['changes.buildServiceB'] ]
+      buildServiceC: $[ stageDependencies.DetectChanges.Detect.outputs['changes.buildServiceC'] ]
+      buildShared:   $[ stageDependencies.DetectChanges.Detect.outputs['changes.buildShared'] ]
+    jobs:
+
+      # Shared library – if shared changed, rebuild all
+      - job: BuildShared
+        displayName: Build Shared Library
+        condition: or(eq(variables['buildShared'], 'true'), eq(variables['Build.Reason'], 'Manual'))
+        steps:
+          - checkout: self
+          - script: |
+              echo "Building shared library..."
+              dotnet build shared/MyApp.Shared.sln --configuration $(buildConfiguration)
+            displayName: Build shared
+
+      # Service A
+      - job: BuildServiceA
+        displayName: Build Service A
+        condition: |
+          or(
+            eq(variables['buildServiceA'], 'true'),
+            eq(variables['buildShared'], 'true'),
+            eq(variables['Build.Reason'], 'Manual')
+          )
+        steps:
+          - checkout: self
+          - script: |
+              echo "Building Service A..."
+              dotnet build services/service-a/ --configuration $(buildConfiguration)
+              dotnet test services/service-a/**/*.Tests.csproj --no-build
+            displayName: Build & test Service A
+
+          - task: Docker@2
+            displayName: Build & push Service A image
+            inputs:
+              command: buildAndPush
+              dockerfile: services/service-a/Dockerfile
+              repository: myacr.azurecr.io/service-a
+              containerRegistry: sc-acr
+              tags: $(Build.BuildId)
+
+      # Service B
+      - job: BuildServiceB
+        displayName: Build Service B
+        condition: |
+          or(
+            eq(variables['buildServiceB'], 'true'),
+            eq(variables['buildShared'], 'true'),
+            eq(variables['Build.Reason'], 'Manual')
+          )
+        steps:
+          - checkout: self
+          - script: |
+              echo "Building Service B..."
+              cd services/service-b && npm ci && npm test
+            displayName: Build & test Service B
+
+          - task: Docker@2
+            displayName: Build & push Service B image
+            inputs:
+              command: buildAndPush
+              dockerfile: services/service-b/Dockerfile
+              repository: myacr.azurecr.io/service-b
+              containerRegistry: sc-acr
+              tags: $(Build.BuildId)
+
+      # Service C
+      - job: BuildServiceC
+        displayName: Build Service C
+        condition: |
+          or(
+            eq(variables['buildServiceC'], 'true'),
+            eq(variables['buildShared'], 'true'),
+            eq(variables['Build.Reason'], 'Manual')
+          )
+        steps:
+          - checkout: self
+          - script: |
+              echo "Building Service C..."
+              cd services/service-c && pip install -r requirements.txt && pytest
+            displayName: Build & test Service C
+
+          - task: Docker@2
+            displayName: Build & push Service C image
+            inputs:
+              command: buildAndPush
+              dockerfile: services/service-c/Dockerfile
+              repository: myacr.azurecr.io/service-c
+              containerRegistry: sc-acr
+              tags: $(Build.BuildId)
+
+  - stage: IntegrationTest
+    displayName: Integration Tests
+    dependsOn: BuildServices
+    condition: succeeded('BuildServices')
+    jobs:
+      - job: IntTest
+        steps:
+          - script: echo "Running cross-service integration tests..."
+            displayName: Integration tests

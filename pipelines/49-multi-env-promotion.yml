@@ -1,0 +1,134 @@
+# ============================================================
+# Pipeline 49: Multi-Environment Promotion Pipeline
+# Complexity: Medium
+# Concepts: sequential environment promotion (dev→staging→prod),
+#           approval gates per environment, rollback job,
+#           environment-scoped variables, health checks between stages
+# ============================================================
+
+trigger:
+  branches:
+    include: [main]
+
+variables:
+  buildArtifact: app-package
+  dotnetVersion: '8.x'
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: Build
+    jobs:
+      - job: BuildAndPublish
+        steps:
+          - checkout: self
+          - task: UseDotNet@2
+            inputs: {version: $(dotnetVersion)}
+          - task: DotNetCoreCLI@2
+            inputs:
+              command: publish
+              publishWebProjects: true
+              arguments: --configuration Release --output $(Build.ArtifactStagingDirectory)
+              zipAfterPublish: true
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: $(Build.ArtifactStagingDirectory)
+              artifact: $(buildArtifact)
+
+  # ── DEV ──────────────────────────────────────────────────────
+  - stage: DeployDev
+    displayName: Deploy → DEV
+    dependsOn: Build
+    variables:
+      environmentUrl: https://myapp-dev.azurewebsites.net
+    jobs:
+      - deployment: Dev
+        environment: dev
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: $(buildArtifact)
+                - bash: echo "Deploying to DEV..."
+                  displayName: Deploy to DEV
+                - bash: |
+                    STATUS=$(curl -s -o /dev/null -w "%{http_code}" $(environmentUrl)/health)
+                    echo "Health: $STATUS"
+                    [ "$STATUS" = "200" ]
+                  displayName: Health check DEV
+                  continueOnError: true
+
+  # ── STAGING ──────────────────────────────────────────────────
+  - stage: DeployStaging
+    displayName: Deploy → Staging
+    dependsOn: DeployDev
+    variables:
+      environmentUrl: https://myapp-staging.azurewebsites.net
+    jobs:
+      - deployment: Staging
+        environment: staging        # approval configured in ADO
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: $(buildArtifact)
+                - bash: echo "Deploying to Staging..."
+                  displayName: Deploy to Staging
+                - bash: |
+                    STATUS=$(curl -s -o /dev/null -w "%{http_code}" $(environmentUrl)/health)
+                    echo "Health: $STATUS"
+                    [ "$STATUS" = "200" ]
+                  displayName: Health check Staging
+                  continueOnError: true
+
+      # Smoke test job after deployment
+      - job: SmokeTests
+        displayName: Staging Smoke Tests
+        dependsOn: Staging
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - script: |
+              echo "Running staging smoke tests..."
+              # Run API tests against staging
+            displayName: Smoke tests
+
+  # ── PRODUCTION ───────────────────────────────────────────────
+  - stage: DeployProd
+    displayName: Deploy → Production
+    dependsOn: DeployStaging
+    condition: and(succeeded('DeployStaging'), eq(variables['Build.SourceBranchName'], 'main'))
+    variables:
+      environmentUrl: https://myapp.azurewebsites.net
+    jobs:
+      - deployment: Production
+        environment: production      # requires approval + business hours check
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: $(buildArtifact)
+                - bash: echo "Deploying to PRODUCTION..."
+                  displayName: Deploy to Production
+                - bash: |
+                    STATUS=$(curl -s -o /dev/null -w "%{http_code}" $(environmentUrl)/health)
+                    echo "Health: $STATUS"
+                    [ "$STATUS" = "200" ]
+                  displayName: Production health check
+
+      # Rollback job (manual trigger via condition=false,
+      # queue with override to enable rollback)
+      - job: RollbackProd
+        displayName: Rollback Production
+        dependsOn: Production
+        condition: failed('Production')    # auto-rollback if deploy fails
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - bash: echo "Initiating production rollback to previous slot..."
+            displayName: Rollback

@@ -1,0 +1,124 @@
+# ============================================================
+# Pipeline 33: Helm Chart – Package, Lint & Deploy
+# Complexity: Medium
+# Concepts: HelmDeploy task, helm lint, helm upgrade --install,
+#           values overrides, chart versioning, OCI registry
+# ============================================================
+
+trigger:
+  branches:
+    include: [main, release/*]
+  paths:
+    include: [helm/**]
+
+variables:
+  helmVersion: '3.14.0'
+  chartPath: helm/myapp
+  releaseName: myapp
+  k8sNamespace: myapp-prod
+  containerRegistry: myacr.azurecr.io
+  imageTag: $(Build.BuildId)
+  aksServiceConnection: sc-aks-prod
+  acrServiceConnection: sc-acr
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: LintAndPackage
+    displayName: Lint & Package Chart
+    jobs:
+      - job: HelmLint
+        steps:
+          - checkout: self
+
+          - task: HelmInstaller@1
+            displayName: Install Helm $(helmVersion)
+            inputs:
+              helmVersion: $(helmVersion)
+              installKubectl: false
+
+          # Helm lint – validate chart syntax
+          - bash: |
+              helm lint $(chartPath) \
+                --values $(chartPath)/values.yaml \
+                --values $(chartPath)/values.prod.yaml \
+                --set image.tag=$(imageTag)
+            displayName: helm lint
+
+          # Helm template – dry-run render to stdout
+          - bash: |
+              helm template $(releaseName) $(chartPath) \
+                --namespace $(k8sNamespace) \
+                --values $(chartPath)/values.prod.yaml \
+                --set image.tag=$(imageTag) \
+                | tee $(Agent.TempDirectory)/rendered-manifests.yaml
+            displayName: helm template (dry-run)
+
+          # Package chart
+          - bash: |
+              helm package $(chartPath) \
+                --version "1.0.$(Build.BuildId)" \
+                --app-version "$(imageTag)" \
+                --destination $(Build.ArtifactStagingDirectory)
+            displayName: helm package
+
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: $(Build.ArtifactStagingDirectory)
+              artifact: helm-chart
+
+  - stage: Deploy
+    displayName: Deploy Helm Release
+    dependsOn: LintAndPackage
+    jobs:
+      - deployment: HelmDeploy
+        environment: production
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: HelmInstaller@1
+                  inputs:
+                    helmVersion: $(helmVersion)
+
+                # Push chart to ACR OCI registry
+                - task: AzureCLI@2
+                  displayName: Push chart to ACR
+                  inputs:
+                    azureSubscription: sc-azure-prod
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      az acr helm push \
+                        --name $(containerRegistry) \
+                        $(Pipeline.Workspace)/helm-chart/*.tgz \
+                        || true   # OCI push
+                  continueOnError: true
+
+                # Deploy / upgrade via HelmDeploy task
+                - task: HelmDeploy@0
+                  displayName: helm upgrade --install
+                  inputs:
+                    connectionType: Kubernetes Service Connection
+                    kubernetesServiceEndpoint: $(aksServiceConnection)
+                    namespace: $(k8sNamespace)
+                    command: upgrade
+                    chartType: FilePath
+                    chartPath: $(chartPath)
+                    releaseName: $(releaseName)
+                    overrideValues: |
+                      image.tag=$(imageTag)
+                      replicaCount=3
+                    valueFile: $(chartPath)/values.prod.yaml
+                    install: true              # --install flag
+                    waitForExecution: true     # wait for pods to be ready
+                    arguments: --timeout 10m --atomic
+
+                # Verify deployment
+                - bash: |
+                    helm status $(releaseName) -n $(k8sNamespace)
+                  displayName: helm status

@@ -1,0 +1,247 @@
+# ============================================================
+# Pipeline 76: Multi-Cloud Deployment (Azure + AWS)
+# Complexity: Highly Complex
+# Concepts: Azure and AWS parallel deployments, cross-cloud
+#           secrets management, DNS failover, unified health check,
+#           cost tagging, provider-specific CLI tasks
+# ============================================================
+
+trigger:
+  branches:
+    include: [main]
+  paths:
+    include: [src/**, infra/azure/**, infra/aws/**]
+
+parameters:
+  - name: targetClouds
+    type: object
+    default:
+      - name: azure
+        region: eastus
+        weight: 70
+      - name: aws
+        region: us-east-1
+        weight: 30
+  - name: failoverEnabled
+    type: boolean
+    default: true
+  - name: environment
+    type: string
+    default: prod
+    values: [staging, prod]
+
+variables:
+  - group: multicloud-${{ parameters.environment }}-secrets
+  - name: imageTag
+    value: $(Build.BuildId)
+  - name: appName
+    value: my-multicloud-app
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: BuildAndPush
+    displayName: Build & Push Multi-Cloud Images
+    jobs:
+      - job: BuildAzureImage
+        displayName: Build → ACR
+        steps:
+          - checkout: self
+          - task: Docker@2
+            inputs:
+              command: buildAndPush
+              repository: $(acrName).azurecr.io/$(appName)
+              containerRegistry: sc-acr
+              tags: $(imageTag)
+
+      - job: BuildAWSImage
+        displayName: Build → ECR
+        steps:
+          - checkout: self
+          - task: AWSCLI@1
+            displayName: Authenticate ECR
+            inputs:
+              awsCredentials: sc-aws
+              regionName: us-east-1
+              awsCommand: ecr
+              awsSubCommand: get-login-password
+              failOnStandardError: false
+          - bash: |
+              aws ecr get-login-password --region us-east-1 \
+                | docker login --username AWS \
+                  --password-stdin $(awsAccountId).dkr.ecr.us-east-1.amazonaws.com
+              docker build -t $(awsAccountId).dkr.ecr.us-east-1.amazonaws.com/$(appName):$(imageTag) .
+              docker push $(awsAccountId).dkr.ecr.us-east-1.amazonaws.com/$(appName):$(imageTag)
+            displayName: Build and push to ECR
+            env:
+              AWS_ACCESS_KEY_ID: $(awsAccessKey)
+              AWS_SECRET_ACCESS_KEY: $(awsSecretKey)
+
+  - stage: ValidateInfra
+    displayName: Validate Infrastructure (Both Clouds)
+    dependsOn: BuildAndPush
+    jobs:
+      - job: ValidateAzure
+        steps:
+          - checkout: self
+          - task: AzureCLI@2
+            displayName: Bicep what-if
+            inputs:
+              azureSubscription: sc-azure-${{ parameters.environment }}
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az deployment group what-if \
+                  --resource-group rg-$(appName)-${{ parameters.environment }} \
+                  --template-file infra/azure/main.bicep \
+                  --parameters environment=${{ parameters.environment }} imageTag=$(imageTag)
+
+      - job: ValidateAWS
+        steps:
+          - checkout: self
+          - bash: |
+              pip install cfn-lint
+              cfn-lint infra/aws/template.yml -f json
+            displayName: Lint CloudFormation template
+          - bash: |
+              aws cloudformation validate-template \
+                --template-body file://infra/aws/template.yml
+            displayName: Validate CloudFormation
+            env:
+              AWS_ACCESS_KEY_ID: $(awsAccessKey)
+              AWS_SECRET_ACCESS_KEY: $(awsSecretKey)
+              AWS_DEFAULT_REGION: us-east-1
+
+  - stage: DeployAzure
+    displayName: Deploy to Azure
+    dependsOn: ValidateInfra
+    jobs:
+      - deployment: AzureDeploy
+        environment: ${{ parameters.environment }}-azure
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - task: AzureCLI@2
+                  displayName: Deploy to Azure Container Apps
+                  inputs:
+                    azureSubscription: sc-azure-${{ parameters.environment }}
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      az deployment group create \
+                        --resource-group rg-$(appName)-${{ parameters.environment }} \
+                        --template-file infra/azure/main.bicep \
+                        --parameters \
+                          environment=${{ parameters.environment }} \
+                          imageTag=$(imageTag) \
+                          acrName=$(acrName)
+
+                      # Get Azure endpoint
+                      FQDN=$(az containerapp show \
+                        --resource-group rg-$(appName)-${{ parameters.environment }} \
+                        --name $(appName) \
+                        --query properties.configuration.ingress.fqdn -o tsv)
+                      echo "##vso[task.setvariable variable=azureEndpoint;isOutput=true]https://$FQDN"
+                  name: azDeploy
+
+                - bash: |
+                    sleep 30
+                    curl -sf $(azDeploy.azureEndpoint)/health | jq .
+                  displayName: Azure health check
+
+  - stage: DeployAWS
+    displayName: Deploy to AWS
+    dependsOn: ValidateInfra
+    jobs:
+      - deployment: AWSDeploy
+        environment: ${{ parameters.environment }}-aws
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - bash: |
+                    aws cloudformation deploy \
+                      --template-file infra/aws/template.yml \
+                      --stack-name $(appName)-${{ parameters.environment }} \
+                      --parameter-overrides \
+                        Environment=${{ parameters.environment }} \
+                        ImageTag=$(imageTag) \
+                        AccountId=$(awsAccountId) \
+                      --capabilities CAPABILITY_IAM \
+                      --tags Environment=${{ parameters.environment }} App=$(appName) ManagedBy=ADO
+
+                    # Get AWS endpoint
+                    LB_DNS=$(aws cloudformation describe-stacks \
+                      --stack-name $(appName)-${{ parameters.environment }} \
+                      --query "Stacks[0].Outputs[?OutputKey=='LoadBalancerDNS'].OutputValue" \
+                      --output text)
+                    echo "##vso[task.setvariable variable=awsEndpoint;isOutput=true]http://$LB_DNS"
+                  displayName: Deploy CloudFormation stack
+                  name: awsDeploy
+                  env:
+                    AWS_ACCESS_KEY_ID: $(awsAccessKey)
+                    AWS_SECRET_ACCESS_KEY: $(awsSecretKey)
+                    AWS_DEFAULT_REGION: us-east-1
+
+                - bash: |
+                    sleep 30
+                    curl -sf $(awsDeploy.awsEndpoint)/health | jq .
+                  displayName: AWS health check
+
+  - stage: CrossCloudValidation
+    displayName: Cross-Cloud Validation & DNS Failover
+    dependsOn:
+      - DeployAzure
+      - DeployAWS
+    condition: and(succeeded('DeployAzure'), succeeded('DeployAWS'))
+    variables:
+      azureEp: $[ stageDependencies.DeployAzure.AzureDeploy.outputs['azDeploy.azureEndpoint'] ]
+      awsEp: $[ stageDependencies.DeployAWS.AWSDeploy.outputs['awsDeploy.awsEndpoint'] ]
+    jobs:
+      - job: HealthValidation
+        steps:
+          - bash: |
+              echo "Azure Endpoint: $(azureEp)"
+              echo "AWS Endpoint:   $(awsEp)"
+
+              AZ_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" $(azureEp)/health)
+              AWS_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" $(awsEp)/health)
+
+              echo "Azure HTTP: $AZ_STATUS"
+              echo "AWS HTTP:   $AWS_STATUS"
+
+              if [ "$AZ_STATUS" != "200" ] || [ "$AWS_STATUS" != "200" ]; then
+                echo "##vso[task.logissue type=error]One or both cloud endpoints unhealthy"
+                exit 1
+              fi
+            displayName: Cross-cloud health check
+
+      - job: UpdateDNSWeights
+        dependsOn: HealthValidation
+        condition: and(succeeded(), eq('${{ parameters.failoverEnabled }}', 'true'))
+        steps:
+          - task: AzureCLI@2
+            displayName: Update Azure Traffic Manager weights
+            inputs:
+              azureSubscription: sc-azure-${{ parameters.environment }}
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                ${{ each cloud in parameters.targetClouds }}:
+                - az network traffic-manager endpoint update \
+                    --resource-group rg-global \
+                    --profile-name tm-$(appName) \
+                    --name endpoint-${{ cloud.name }} \
+                    --type externalEndpoints \
+                    --weight ${{ cloud.weight }}
+
+                az network traffic-manager profile show \
+                  --resource-group rg-global \
+                  --name tm-$(appName) \
+                  --query endpoints[].{Name:name,Weight:weight,Status:endpointMonitorStatus} \
+                  -o table

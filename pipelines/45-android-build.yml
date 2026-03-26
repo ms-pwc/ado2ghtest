@@ -1,0 +1,117 @@
+# ============================================================
+# Pipeline 45: Android – Gradle Build, Test & Sign APK
+# Complexity: Medium
+# Concepts: Gradle task, AndroidSigning, emulator tests,
+#           keystore from secure files, APK artifact
+# ============================================================
+
+trigger:
+  branches:
+    include: [main, release/*]
+  paths:
+    include: [android/**]
+
+pool:
+  vmImage: macOS-latest      # Android emulator needs macOS/Linux with KVM
+
+variables:
+  buildConfiguration: release
+  keystoreFileId: android-keystore.jks   # uploaded to ADO Secure Files
+  keyAlias: myapp-key
+
+stages:
+
+  - stage: Build
+    jobs:
+      - job: GradleBuild
+        timeoutInMinutes: 60
+        steps:
+          - checkout: self
+
+          # Set up JDK 17
+          - task: JavaToolInstaller@0
+            displayName: Set up JDK 17
+            inputs:
+              versionSpec: '17'
+              jdkArchitectureOption: x64
+              jdkSourceOption: PreInstalled
+
+          # Cache Gradle files
+          - task: Cache@2
+            displayName: Cache Gradle wrapper
+            inputs:
+              key: 'gradle | "$(Agent.OS)" | android/gradle/wrapper/gradle-wrapper.properties'
+              restoreKeys: gradle | "$(Agent.OS)"
+              path: $(HOME)/.gradle/wrapper
+
+          - task: Cache@2
+            displayName: Cache Gradle dependencies
+            inputs:
+              key: 'gradle-deps | "$(Agent.OS)" | android/build.gradle'
+              restoreKeys: gradle-deps | "$(Agent.OS)"
+              path: $(HOME)/.gradle/caches
+
+          # Download keystore from ADO Secure Files
+          - task: DownloadSecureFile@1
+            displayName: Download keystore
+            name: keystore
+            inputs:
+              secureFile: $(keystoreFileId)
+
+          # Build debug APK first (for unit tests)
+          - task: Gradle@3
+            displayName: Build debug APK
+            inputs:
+              workingDirectory: android
+              gradleWrapperFile: android/gradlew
+              tasks: assembleDebug
+              options: --no-daemon
+              javaHomeOption: JDKVersion
+              jdkVersionOption: '1.17'
+              publishJUnitResults: true
+              testResultsFiles: '**/TEST-*.xml'
+
+          # Run unit tests
+          - task: Gradle@3
+            displayName: Unit tests
+            inputs:
+              workingDirectory: android
+              gradleWrapperFile: android/gradlew
+              tasks: testDebugUnitTest
+              publishJUnitResults: true
+
+          # Build release APK
+          - task: Gradle@3
+            displayName: Build release APK
+            inputs:
+              workingDirectory: android
+              gradleWrapperFile: android/gradlew
+              tasks: assembleRelease
+              options: >
+                -PkeystorePath=$(keystore.secureFilePath)
+                -PkeystorePassword=$(KEYSTORE_PASSWORD)
+                -PkeyAlias=$(keyAlias)
+                -PkeyPassword=$(KEY_PASSWORD)
+
+          # Sign the APK
+          - task: AndroidSigning@3
+            displayName: Sign APK
+            inputs:
+              apkFiles: android/**/outputs/**/*-release-unsigned.apk
+              apksign: true
+              keystoreFile: $(keystore.secureFilePath)
+              keystorePassword: $(KEYSTORE_PASSWORD)
+              keystoreAlias: $(keyAlias)
+              keyPassword: $(KEY_PASSWORD)
+
+          - task: CopyFiles@2
+            displayName: Stage APK
+            inputs:
+              SourceFolder: android
+              Contents: '**/outputs/**/*.apk'
+              TargetFolder: $(Build.ArtifactStagingDirectory)
+
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: $(Build.ArtifactStagingDirectory)
+              artifact: android-apk

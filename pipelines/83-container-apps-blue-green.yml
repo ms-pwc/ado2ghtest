@@ -1,0 +1,270 @@
+# ============================================================
+# Pipeline 83: Azure Container Apps Blue-Green
+# Complexity: Highly Complex
+# Concepts: Azure Container Apps revisions, traffic splitting,
+#           revision labels, blue/green promotion, smoke tests,
+#           automatic rollback, KEDA scaling rules, environment vars
+# ============================================================
+
+trigger:
+  branches:
+    include: [main]
+  paths:
+    include: [src/**, containerapp/**]
+
+parameters:
+  - name: environment
+    type: string
+    default: prod
+    values: [staging, prod]
+  - name: greenTrafficPct
+    type: number
+    default: 100
+    displayName: 'Green traffic % after validation (100 = full cutover)'
+  - name: testBeforePromotion
+    type: boolean
+    default: true
+
+variables:
+  - group: aca-${{ parameters.environment }}-vars
+  - name: rgName
+    value: rg-aca-${{ parameters.environment }}
+  - name: acaEnvName
+    value: aca-env-${{ parameters.environment }}
+  - name: appName
+    value: my-serverless-app
+  - name: imageTag
+    value: $(Build.BuildId)
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: Build
+    jobs:
+      - job: BuildImage
+        steps:
+          - checkout: self
+          - task: Docker@2
+            inputs:
+              command: buildAndPush
+              repository: $(acrName).azurecr.io/$(appName)
+              containerRegistry: sc-acr
+              tags: $(imageTag)
+
+  - stage: DeployGreen
+    displayName: Deploy Green Revision
+    dependsOn: Build
+    jobs:
+      - deployment: DeployGreen
+        environment: ${{ parameters.environment }}-aca
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureCLI@2
+                  displayName: Deploy new green revision
+                  inputs:
+                    azureSubscription: sc-azure-${{ parameters.environment }}
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      # Deploy new revision with no traffic (inactive)
+                      az containerapp update \
+                        --name $(appName) \
+                        --resource-group $(rgName) \
+                        --image $(acrName).azurecr.io/$(appName):$(imageTag) \
+                        --revision-suffix green-$(imageTag) \
+                        --min-replicas 1 \
+                        --max-replicas 10 \
+                        --traffic-weight "latest=0"
+
+                      # Get the new revision name
+                      NEW_REVISION=$(az containerapp revision list \
+                        --name $(appName) \
+                        --resource-group $(rgName) \
+                        --query "sort_by([], &properties.createdTime) | [-1].name" \
+                        -o tsv)
+
+                      echo "New revision: $NEW_REVISION"
+                      echo "##vso[task.setvariable variable=greenRevision;isOutput=true]$NEW_REVISION"
+
+                      # Label the revision
+                      az containerapp revision label add \
+                        --name $(appName) \
+                        --resource-group $(rgName) \
+                        --label green \
+                        --revision "$NEW_REVISION"
+                  name: deployGreen
+
+                - task: AzureCLI@2
+                  displayName: Verify revision health
+                  inputs:
+                    azureSubscription: sc-azure-${{ parameters.environment }}
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      az containerapp revision show \
+                        --name $(appName) \
+                        --resource-group $(rgName) \
+                        --revision $(deployGreen.greenRevision) \
+                        --query "{name:name,running:properties.runningState,active:properties.active}" \
+                        -o table
+
+  - stage: SmokeTestGreen
+    displayName: Smoke Test Green Revision
+    dependsOn: DeployGreen
+    condition: and(succeeded(), eq('${{ parameters.testBeforePromotion }}', 'true'))
+    variables:
+      greenRevision: $[ stageDependencies.DeployGreen.DeployGreen.outputs['deployGreen.greenRevision'] ]
+    jobs:
+      - job: SmokeTests
+        steps:
+          - task: AzureCLI@2
+            displayName: Get green revision URL
+            inputs:
+              azureSubscription: sc-azure-${{ parameters.environment }}
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                # Container Apps revision-specific URL
+                GREEN_URL=$(az containerapp revision show \
+                  --name $(appName) \
+                  --resource-group $(rgName) \
+                  --revision $(greenRevision) \
+                  --query properties.fqdn -o tsv 2>/dev/null)
+
+                # Fallback to label URL
+                if [ -z "$GREEN_URL" ]; then
+                  APP_URL=$(az containerapp show \
+                    --name $(appName) \
+                    --resource-group $(rgName) \
+                    --query properties.configuration.ingress.fqdn -o tsv)
+                  GREEN_URL="https://green---$APP_URL"
+                fi
+
+                echo "Green URL: $GREEN_URL"
+                echo "##vso[task.setvariable variable=greenUrl]$GREEN_URL"
+
+          - bash: |
+              MAX_RETRIES=10
+              for i in $(seq 1 $MAX_RETRIES); do
+                HTTP_CODE=$(curl -sf -o /dev/null -w "%{http_code}" $(greenUrl)/health || echo "000")
+                echo "Attempt $i: HTTP $HTTP_CODE"
+                if [ "$HTTP_CODE" = "200" ]; then
+                  echo "Green revision is healthy"
+                  exit 0
+                fi
+                sleep 15
+              done
+              echo "##vso[task.logissue type=error]Green revision health check failed after $MAX_RETRIES attempts"
+              exit 1
+            displayName: Health check green revision
+
+          - bash: |
+              # Quick smoke test suite
+              curl -sf $(greenUrl)/api/version | jq .
+              curl -sf $(greenUrl)/api/status | jq .
+            displayName: API smoke tests
+
+  - stage: PromoteGreen
+    displayName: Promote Green to Production Traffic
+    dependsOn:
+      - DeployGreen
+      - SmokeTestGreen
+    condition: |
+      or(
+        and(succeeded('DeployGreen'), eq('${{ parameters.testBeforePromotion }}', 'false')),
+        and(succeeded('SmokeTestGreen'), eq('${{ parameters.testBeforePromotion }}', 'true'))
+      )
+    variables:
+      greenRevision: $[ stageDependencies.DeployGreen.DeployGreen.outputs['deployGreen.greenRevision'] ]
+    jobs:
+      - deployment: PromoteTraffic
+        environment: ${{ parameters.environment }}-aca
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureCLI@2
+                  displayName: Shift traffic to green
+                  inputs:
+                    azureSubscription: sc-azure-${{ parameters.environment }}
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      GREEN_PCT=${{ parameters.greenTrafficPct }}
+                      BLUE_PCT=$(( 100 - GREEN_PCT ))
+
+                      echo "Setting green=$GREEN_PCT%, blue=$BLUE_PCT%"
+
+                      # Get current blue revision
+                      BLUE_REVISION=$(az containerapp revision list \
+                        --name $(appName) \
+                        --resource-group $(rgName) \
+                        --query "sort_by([?name != '$(greenRevision)' && properties.active], &properties.createdTime) | [-1].name" \
+                        -o tsv)
+
+                      if [ -n "$BLUE_REVISION" ] && [ "$BLUE_PCT" -gt "0" ]; then
+                        az containerapp ingress traffic set \
+                          --name $(appName) \
+                          --resource-group $(rgName) \
+                          --revision-weight \
+                            "$BLUE_REVISION=$BLUE_PCT" \
+                            "$(greenRevision)=$GREEN_PCT"
+                      else
+                        az containerapp ingress traffic set \
+                          --name $(appName) \
+                          --resource-group $(rgName) \
+                          --revision-weight "$(greenRevision)=100"
+                      fi
+
+                      echo "Traffic configuration:"
+                      az containerapp revision list \
+                        --name $(appName) \
+                        --resource-group $(rgName) \
+                        --query "[].{revision:name,traffic:properties.trafficWeight,active:properties.active}" \
+                        -o table
+
+                - task: AzureCLI@2
+                  displayName: Deactivate old revisions
+                  inputs:
+                    azureSubscription: sc-azure-${{ parameters.environment }}
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      # Keep last 2 revisions, deactivate older ones
+                      OLD_REVISIONS=$(az containerapp revision list \
+                        --name $(appName) \
+                        --resource-group $(rgName) \
+                        --query "sort_by([], &properties.createdTime) | [:-2][].name" -o tsv)
+
+                      for OLD_REV in $OLD_REVISIONS; do
+                        echo "Deactivating old revision: $OLD_REV"
+                        az containerapp revision deactivate \
+                          --name $(appName) \
+                          --resource-group $(rgName) \
+                          --revision "$OLD_REV"
+                      done
+
+                    on:
+                      failure:
+                        steps:
+                          - task: AzureCLI@2
+                            displayName: Rollback – revert to blue
+                            inputs:
+                              azureSubscription: sc-azure-${{ parameters.environment }}
+                              scriptType: bash
+                              scriptLocation: inlineScript
+                              inlineScript: |
+                                echo "ROLLBACK: Reverting all traffic to blue revision"
+                                BLUE_REVISION=$(az containerapp revision list \
+                                  --name $(appName) \
+                                  --resource-group $(rgName) \
+                                  --query "sort_by([?name != '$(greenRevision)'], &properties.createdTime) | [-1].name" \
+                                  -o tsv)
+                                az containerapp ingress traffic set \
+                                  --name $(appName) \
+                                  --resource-group $(rgName) \
+                                  --revision-weight "$BLUE_REVISION=100"

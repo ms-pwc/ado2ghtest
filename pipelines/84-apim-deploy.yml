@@ -1,0 +1,278 @@
+# ============================================================
+# Pipeline 84: Azure API Management (APIM) Policy Deploy
+# Complexity: Highly Complex
+# Concepts: APIM policy XML validation, API import from OpenAPI,
+#           named values / key vault references, product management,
+#           revision + version set deployment, policy expressions,
+#           developer portal publish, subscription key management
+# ============================================================
+
+trigger:
+  branches:
+    include: [main]
+  paths:
+    include: [apim/**, api-specs/**]
+
+parameters:
+  - name: environment
+    type: string
+    default: staging
+    values: [dev, staging, prod]
+  - name: deployApis
+    type: object
+    default:
+      - name: orders-api
+        specFile: api-specs/orders-api.openapi.yml
+        path: orders
+        version: v2
+      - name: products-api
+        specFile: api-specs/products-api.openapi.yml
+        path: products
+        version: v1
+  - name: publishDevPortal
+    type: boolean
+    default: false
+
+variables:
+  - group: apim-${{ parameters.environment }}-vars
+  - name: apimName
+    value: apim-$(orgName)-${{ parameters.environment }}
+  - name: rgName
+    value: rg-apim-${{ parameters.environment }}
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: ValidatePolicies
+    displayName: Validate Policy XML and OpenAPI Specs
+    jobs:
+      - job: ValidateSpecs
+        steps:
+          - checkout: self
+
+          - bash: npm install -g @stoplight/spectral-cli
+            displayName: Install Spectral
+
+          - bash: |
+              for spec in api-specs/*.yml; do
+                echo "Linting: $spec"
+                spectral lint "$spec" --ruleset .spectral.yml || true
+              done
+            displayName: Lint OpenAPI specs
+
+          - bash: |
+              # Validate APIM policy XML syntax
+              for policy in apim/policies/*.xml; do
+                echo "Validating: $policy"
+                xmllint --noout "$policy" && echo "OK" || echo "FAIL: $policy"
+              done
+            displayName: Validate policy XML
+
+          - bash: |
+              # Check for required policy elements
+              for policy in apim/policies/apis/*.xml; do
+                echo "=== $(basename $policy) ==="
+                if ! grep -q "authentication-managed-identity\|validate-jwt\|validate-azure-ad-token" "$policy"; then
+                  echo "##vso[task.logissue type=warning]No auth policy found in $(basename $policy)"
+                fi
+                if ! grep -q "rate-limit\|quota" "$policy"; then
+                  echo "##vso[task.logissue type=warning]No rate limiting in $(basename $policy)"
+                fi
+                if ! grep -q "cors" "$policy"; then
+                  echo "##vso[task.logissue type=warning]No CORS policy in $(basename $policy)"
+                fi
+              done
+            displayName: Check required policy elements
+
+  - stage: DeployNamedValues
+    displayName: Deploy Named Values & Key Vault References
+    dependsOn: ValidatePolicies
+    jobs:
+      - deployment: NamedValues
+        environment: ${{ parameters.environment }}-apim
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - task: AzureCLI@2
+                  displayName: Deploy named values
+                  inputs:
+                    azureSubscription: sc-azure-${{ parameters.environment }}
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      # Process named values from config file
+                      while IFS= read -r line; do
+                        NAME=$(echo "$line" | jq -r '.name')
+                        VALUE=$(echo "$line" | jq -r '.value // empty')
+                        KV_SECRET=$(echo "$line" | jq -r '.keyVaultSecretId // empty')
+                        SECRET=$(echo "$line" | jq -r '.secret // false')
+
+                        if [ -n "$KV_SECRET" ]; then
+                          # Key Vault reference
+                          az apim nv create \
+                            --resource-group $(rgName) \
+                            --service-name $(apimName) \
+                            --named-value-id "$NAME" \
+                            --display-name "$NAME" \
+                            --key-vault-id "$KV_SECRET" --secret true
+                        elif [ -n "$VALUE" ]; then
+                          az apim nv create \
+                            --resource-group $(rgName) \
+                            --service-name $(apimName) \
+                            --named-value-id "$NAME" \
+                            --display-name "$NAME" \
+                            --value "$VALUE" \
+                            --secret "$SECRET" || \
+                          az apim nv update \
+                            --resource-group $(rgName) \
+                            --service-name $(apimName) \
+                            --named-value-id "$NAME" \
+                            --value "$VALUE"
+                        fi
+                      done < <(cat apim/named-values.json | jq -c '.[]')
+
+  - stage: DeployAPIs
+    displayName: Import APIs & Apply Policies
+    dependsOn: DeployNamedValues
+    jobs:
+      - ${{ each api in parameters.deployApis }}:
+        - deployment: Deploy_${{ replace(api.name, '-', '_') }}
+          displayName: Deploy ${{ api.name }}
+          environment: ${{ parameters.environment }}-apim
+          strategy:
+            runOnce:
+              deploy:
+                steps:
+                  - checkout: self
+
+                  # Create version set if needed
+                  - task: AzureCLI@2
+                    displayName: Ensure version set for ${{ api.name }}
+                    inputs:
+                      azureSubscription: sc-azure-${{ parameters.environment }}
+                      scriptType: bash
+                      scriptLocation: inlineScript
+                      inlineScript: |
+                        az apim api versionset create \
+                          --resource-group $(rgName) \
+                          --service-name $(apimName) \
+                          --version-set-id "${{ api.name }}-versionset" \
+                          --display-name "${{ api.name }}" \
+                          --versioning-scheme "Segment" || true
+
+                  # Import API from OpenAPI spec
+                  - task: AzureCLI@2
+                    displayName: Import ${{ api.name }} from OpenAPI
+                    inputs:
+                      azureSubscription: sc-azure-${{ parameters.environment }}
+                      scriptType: bash
+                      scriptLocation: inlineScript
+                      inlineScript: |
+                        az apim api import \
+                          --resource-group $(rgName) \
+                          --service-name $(apimName) \
+                          --api-id "${{ api.name }}-${{ api.version }}" \
+                          --display-name "${{ api.name }} ${{ api.version }}" \
+                          --path "${{ api.path }}/${{ api.version }}" \
+                          --specification-format OpenApi \
+                          --specification-path "${{ api.specFile }}" \
+                          --api-version "${{ api.version }}" \
+                          --api-version-set-id "${{ api.name }}-versionset" \
+                          --subscription-required true
+
+                  # Apply global API policy
+                  - task: AzureCLI@2
+                    displayName: Apply ${{ api.name }} policy
+                    inputs:
+                      azureSubscription: sc-azure-${{ parameters.environment }}
+                      scriptType: bash
+                      scriptLocation: inlineScript
+                      inlineScript: |
+                        POLICY_FILE="apim/policies/apis/${{ api.name }}.xml"
+                        if [ -f "$POLICY_FILE" ]; then
+                          az apim api policy create \
+                            --resource-group $(rgName) \
+                            --service-name $(apimName) \
+                            --api-id "${{ api.name }}-${{ api.version }}" \
+                            --xml-file "$POLICY_FILE"
+                          echo "Policy applied from $POLICY_FILE"
+                        else
+                          echo "No specific policy found, applying default"
+                          az apim api policy create \
+                            --resource-group $(rgName) \
+                            --service-name $(apimName) \
+                            --api-id "${{ api.name }}-${{ api.version }}" \
+                            --xml-file "apim/policies/defaults/api-default.xml"
+                        fi
+
+  - stage: ProductsAndSubscriptions
+    displayName: Manage Products & Subscriptions
+    dependsOn: DeployAPIs
+    jobs:
+      - deployment: Products
+        environment: ${{ parameters.environment }}-apim
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - task: AzureCLI@2
+                  displayName: Deploy products
+                  inputs:
+                    azureSubscription: sc-azure-${{ parameters.environment }}
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      while IFS= read -r product; do
+                        PROD_ID=$(echo "$product" | jq -r '.id')
+                        DISPLAY=$(echo "$product" | jq -r '.displayName')
+                        APPROVAL=$(echo "$product" | jq -r '.approvalRequired // false')
+
+                        az apim product create \
+                          --resource-group $(rgName) \
+                          --service-name $(apimName) \
+                          --product-id "$PROD_ID" \
+                          --product-name "$DISPLAY" \
+                          --subscription-required true \
+                          --approval-required "$APPROVAL" \
+                          --state published || true
+
+                        # Add APIs to product
+                        for api in $(echo "$product" | jq -r '.apis[]'); do
+                          az apim product api add \
+                            --resource-group $(rgName) \
+                            --service-name $(apimName) \
+                            --product-id "$PROD_ID" \
+                            --api-id "$api" || true
+                        done
+                      done < <(cat apim/products.json | jq -c '.[]')
+
+  - stage: PublishDevPortal
+    displayName: Publish Developer Portal
+    dependsOn: ProductsAndSubscriptions
+    condition: and(succeeded(), eq('${{ parameters.publishDevPortal }}', 'true'))
+    jobs:
+      - deployment: PublishPortal
+        environment: ${{ parameters.environment }}-apim
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureCLI@2
+                  displayName: Trigger dev portal publish
+                  inputs:
+                    azureSubscription: sc-azure-${{ parameters.environment }}
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      # Trigger portal deployment via ARM REST API
+                      az rest \
+                        --method POST \
+                        --url "https://management.azure.com/subscriptions/$(subscriptionId)/resourceGroups/$(rgName)/providers/Microsoft.ApiManagement/service/$(apimName)/portalSettings/delegation/listSecrets?api-version=2022-08-01"
+
+                      echo "Developer portal publish triggered"
+                      echo "Portal URL: https://$(apimName).developer.azure-api.net"

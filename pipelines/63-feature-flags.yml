@@ -1,0 +1,163 @@
+# ============================================================
+# Pipeline 63: Feature Flag Release Pipeline
+# Complexity: Complex
+# Concepts: LaunchDarkly / Azure App Configuration feature flags,
+#           gradual rollout percentages, flag-gated deployment,
+#           flag cleanup post-release
+# ============================================================
+
+trigger:
+  branches:
+    include: [main]
+
+parameters:
+  - name: featureFlagKey
+    displayName: Feature Flag Key
+    type: string
+    default: new-checkout-flow
+
+  - name: rolloutPercentage
+    displayName: Initial Rollout %
+    type: number
+    default: 10
+
+variables:
+  azureServiceConnection: sc-azure-prod
+  appConfigEndpoint: https://myapp-appconfig.azconfig.io
+  featureFlagLabel: production
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: Build
+    jobs:
+      - job: BuildApp
+        steps:
+          - checkout: self
+          - task: UseDotNet@2
+            inputs: {version: '8.x'}
+          - task: DotNetCoreCLI@2
+            inputs:
+              command: publish
+              publishWebProjects: true
+              arguments: --configuration Release --output $(Build.ArtifactStagingDirectory)
+              zipAfterPublish: true
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: $(Build.ArtifactStagingDirectory)
+              artifact: app
+
+  - stage: EnableFeatureFlag
+    displayName: Enable Feature Flag (${{ parameters.rolloutPercentage }}%)
+    dependsOn: Build
+    jobs:
+      - job: SetFeatureFlag
+        steps:
+          - task: AzureCLI@2
+            displayName: Create/update feature flag in App Config
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                # Create feature flag with gradual rollout filter
+                az appconfig feature set \
+                  --endpoint $(appConfigEndpoint) \
+                  --feature "${{ parameters.featureFlagKey }}" \
+                  --label $(featureFlagLabel) \
+                  --yes
+
+                # Add percentage rollout filter
+                az appconfig feature filter add \
+                  --endpoint $(appConfigEndpoint) \
+                  --feature "${{ parameters.featureFlagKey }}" \
+                  --label $(featureFlagLabel) \
+                  --filter-name Microsoft.Percentage \
+                  --filter-parameters Value=${{ parameters.rolloutPercentage }} \
+                  --yes
+
+                # Enable the flag
+                az appconfig feature enable \
+                  --endpoint $(appConfigEndpoint) \
+                  --feature "${{ parameters.featureFlagKey }}" \
+                  --label $(featureFlagLabel) \
+                  --yes
+
+                echo "Feature flag '${{ parameters.featureFlagKey }}' enabled at ${{ parameters.rolloutPercentage }}%"
+
+  - stage: DeployWithFlag
+    displayName: Deploy App
+    dependsOn: EnableFeatureFlag
+    jobs:
+      - deployment: Deploy
+        environment: production
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: app
+
+                - task: AzureWebApp@1
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    appName: myapp-webapp
+                    package: $(Pipeline.Workspace)/app/**/*.zip
+
+  - stage: MonitorRollout
+    displayName: Monitor Feature Rollout
+    dependsOn: DeployWithFlag
+    jobs:
+      - job: Monitor
+        steps:
+          # Monitor telemetry for 15 minutes after rollout
+          - bash: |
+              echo "Monitoring feature '${{ parameters.featureFlagKey }}' rollout..."
+              echo "Initial rollout: ${{ parameters.rolloutPercentage }}%"
+              
+              # In real scenario: query App Insights for error rate
+              for i in $(seq 1 5); do
+                echo "Check $i/5 - Querying error rate metrics..."
+                sleep 60   # wait 1 min between checks
+                
+                # Placeholder: az monitor metrics list ...
+                ERROR_RATE=0   # replace with actual query
+                echo "Error rate: ${ERROR_RATE}%"
+                
+                if [ "${ERROR_RATE}" -gt 5 ]; then
+                  echo "Error rate too high! Rolling back feature flag..."
+                  exit 1
+                fi
+              done
+              echo "Rollout monitoring PASSED. Promote to 100%?"
+            displayName: Monitor error rate
+            timeoutInMinutes: 10
+
+  - stage: PromoteFlag
+    displayName: Promote to 100%
+    dependsOn: MonitorRollout
+    condition: succeeded('MonitorRollout')
+    jobs:
+      - deployment: PromoteToFull
+        environment: production
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureCLI@2
+                  displayName: Set flag to 100%
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      az appconfig feature filter add \
+                        --endpoint $(appConfigEndpoint) \
+                        --feature "${{ parameters.featureFlagKey }}" \
+                        --label $(featureFlagLabel) \
+                        --filter-name Microsoft.Percentage \
+                        --filter-parameters Value=100 \
+                        --yes
+                      echo "Feature flag at 100%!"

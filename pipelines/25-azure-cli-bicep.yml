@@ -1,0 +1,112 @@
+# ============================================================
+# Pipeline 25: Azure CLI & ARM / Bicep Deploy
+# Complexity: Medium
+# Concepts: AzureCLI task, AzureResourceManagerTemplateDeployment,
+#           service connections, deployment modes, what-if
+# ============================================================
+
+trigger:
+  branches:
+    include: [main]
+  paths:
+    include: [infra/**]
+
+variables:
+  azureServiceConnection: sc-azure-prod
+  resourceGroupName: rg-myapp-prod
+  location: eastus
+  templateFile: infra/main.bicep
+  parametersFile: infra/main.parameters.json
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: Validate
+    displayName: Validate IaC
+    jobs:
+      - job: BicepValidate
+        steps:
+          - checkout: self
+
+          # Install Bicep CLI
+          - task: AzureCLI@2
+            displayName: Install Bicep & validate template
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az bicep install
+                az bicep version
+                az bicep build --file $(templateFile) --outdir $(Agent.TempDirectory)
+                echo "Bicep compiled successfully"
+
+          # What-If (preview changes without applying)
+          - task: AzureCLI@2
+            displayName: What-If deployment preview
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az deployment group what-if \
+                  --resource-group $(resourceGroupName) \
+                  --template-file $(templateFile) \
+                  --parameters @$(parametersFile) \
+                  --parameters buildId=$(Build.BuildId)
+
+  - stage: Deploy
+    displayName: Deploy Infrastructure
+    dependsOn: Validate
+    jobs:
+      - job: DeployBicep
+        steps:
+          - checkout: self
+
+          # Deploy Bicep template using the ARM task
+          - task: AzureResourceManagerTemplateDeployment@3
+            displayName: Deploy Bicep template
+            inputs:
+              deploymentScope: Resource Group
+              azureResourceManagerConnection: $(azureServiceConnection)
+              subscriptionId: $(ARM_SUBSCRIPTION_ID)
+              action: Create Or Update Resource Group
+              resourceGroupName: $(resourceGroupName)
+              location: $(location)
+              templateLocation: Linked artifact
+              csmFile: $(templateFile)
+              csmParametersFile: $(parametersFile)
+              overrideParameters: -buildId $(Build.BuildId) -environment prod
+              deploymentMode: Incremental      # Incremental | Complete | Validation
+
+          # Post-deploy: query deployed resources via Azure CLI
+          - task: AzureCLI@2
+            displayName: Verify deployed resources
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                echo "=== Deployed Resources ==="
+                az resource list \
+                  --resource-group $(resourceGroupName) \
+                  --query "[].{Name:name, Type:type, Location:location}" \
+                  --output table
+
+          # Tag the resource group with build metadata
+          - task: AzureCLI@2
+            displayName: Tag resource group
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az tag update \
+                  --resource-id $(az group show -n $(resourceGroupName) --query id -o tsv) \
+                  --operation Merge \
+                  --tags \
+                    BuildId=$(Build.BuildId) \
+                    DeployedBy=$(Build.RequestedFor) \
+                    Branch=$(Build.SourceBranchName)

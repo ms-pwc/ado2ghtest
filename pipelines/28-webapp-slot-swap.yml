@@ -1,0 +1,123 @@
+# ============================================================
+# Pipeline 28: Azure Web App Deploy – Slot Swap
+# Complexity: Medium
+# Concepts: AzureWebApp task, slot deployment, swap slots,
+#           app settings override, AzureAppServiceSettings
+# ============================================================
+
+trigger:
+  branches:
+    include: [main]
+
+variables:
+  azureServiceConnection: sc-azure-prod
+  webAppName: myapp-webapp
+  resourceGroup: rg-myapp-prod
+  stagingSlot: staging
+  dotnetVersion: '8.x'
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: Build
+    jobs:
+      - job: BuildDotNet
+        steps:
+          - checkout: self
+
+          - task: UseDotNet@2
+            inputs:
+              version: $(dotnetVersion)
+
+          - task: DotNetCoreCLI@2
+            displayName: dotnet publish
+            inputs:
+              command: publish
+              publishWebProjects: true
+              arguments: --configuration Release --output $(Build.ArtifactStagingDirectory)
+              zipAfterPublish: true
+
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: $(Build.ArtifactStagingDirectory)
+              artifact: webapp
+
+  - stage: DeployToSlot
+    displayName: Deploy to Staging Slot
+    dependsOn: Build
+    jobs:
+      - deployment: SlotDeploy
+        environment: staging
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: webapp
+
+                # Configure app settings on the staging slot
+                - task: AzureAppServiceSettings@1
+                  displayName: Set staging slot app settings
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    appName: $(webAppName)
+                    resourceGroupName: $(resourceGroup)
+                    slotName: $(stagingSlot)
+                    appSettings: |
+                      [
+                        {"name": "ASPNETCORE_ENVIRONMENT", "value": "Staging", "slotSetting": true},
+                        {"name": "BUILD_ID", "value": "$(Build.BuildId)", "slotSetting": false}
+                      ]
+
+                # Deploy to staging slot
+                - task: AzureWebApp@1
+                  displayName: Deploy to staging slot
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    appType: webApp
+                    appName: $(webAppName)
+                    deployToSlotOrASE: true
+                    resourceGroupName: $(resourceGroup)
+                    slotName: $(stagingSlot)
+                    package: $(Pipeline.Workspace)/webapp/**/*.zip
+                    deploymentMethod: zipDeploy
+
+                # Smoke test the staging slot
+                - bash: |
+                    SLOT_URL="https://$(webAppName)-$(stagingSlot).azurewebsites.net/health"
+                    echo "Hitting: $SLOT_URL"
+                    STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$SLOT_URL")
+                    echo "Health check status: $STATUS"
+                    [ "$STATUS" -eq 200 ]
+                  displayName: Smoke test staging slot
+
+  - stage: SwapToProduction
+    displayName: Swap Staging → Production
+    dependsOn: DeployToSlot
+    jobs:
+      - deployment: SlotSwap
+        environment: production         # requires approval in ADO
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                # Swap slots (staging → production, zero-downtime)
+                - task: AzureAppServiceManage@0
+                  displayName: Swap staging → production
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    Action: Swap Slots
+                    WebAppName: $(webAppName)
+                    ResourceGroupName: $(resourceGroup)
+                    SourceSlot: $(stagingSlot)
+                    SwapWithProduction: true
+
+                # Verify production
+                - bash: |
+                    PROD_URL="https://$(webAppName).azurewebsites.net/health"
+                    STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$PROD_URL")
+                    echo "Production health: $STATUS"
+                    [ "$STATUS" -eq 200 ]
+                  displayName: Smoke test production

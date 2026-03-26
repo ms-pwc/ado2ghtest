@@ -1,0 +1,118 @@
+# ============================================================
+# Pipeline 62: Azure Service Bus – Integration Test Pipeline
+# Complexity: Complex
+# Concepts: Service Bus sidecar via Azure CLI, message producer/consumer
+#           testing, end-to-end message flow, cleanup
+# ============================================================
+
+trigger:
+  branches:
+    include: [main]
+  paths:
+    include: [src/messaging/**, tests/integration/**]
+
+variables:
+  azureServiceConnection: sc-azure-test
+  serviceBusNamespace: myapp-sb-test-$(Build.BuildId)
+  resourceGroup: rg-myapp-test
+  location: eastus
+  dotnetVersion: '8.x'
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: ProvisionTestInfra
+    displayName: Provision Test Service Bus
+    jobs:
+      - job: CreateSB
+        steps:
+          - task: AzureCLI@2
+            displayName: Create Service Bus namespace
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az servicebus namespace create \
+                  --resource-group $(resourceGroup) \
+                  --name $(serviceBusNamespace) \
+                  --location $(location) \
+                  --sku Standard
+                
+                az servicebus queue create \
+                  --resource-group $(resourceGroup) \
+                  --namespace-name $(serviceBusNamespace) \
+                  --name orders
+                
+                az servicebus topic create \
+                  --resource-group $(resourceGroup) \
+                  --namespace-name $(serviceBusNamespace) \
+                  --name events
+                
+                CONN=$(az servicebus namespace authorization-rule keys list \
+                  --resource-group $(resourceGroup) \
+                  --namespace-name $(serviceBusNamespace) \
+                  --name RootManageSharedAccessKey \
+                  --query primaryConnectionString -o tsv)
+                
+                echo "##vso[task.setvariable variable=sbConnectionString;isOutput=true;issecret=true]$CONN"
+                echo "Service Bus created: $(serviceBusNamespace)"
+            name: sbSetup
+
+  - stage: IntegrationTests
+    displayName: Run Integration Tests
+    dependsOn: ProvisionTestInfra
+    variables:
+      sbConnectionString: $[ stageDependencies.ProvisionTestInfra.CreateSB.outputs['sbSetup.sbConnectionString'] ]
+    jobs:
+      - job: MessagingTests
+        steps:
+          - checkout: self
+
+          - task: UseDotNet@2
+            inputs:
+              version: $(dotnetVersion)
+
+          - task: DotNetCoreCLI@2
+            displayName: Run messaging integration tests
+            inputs:
+              command: test
+              projects: tests/integration/Messaging.Tests.csproj
+              arguments: >
+                --configuration Release
+                --logger trx
+                --results-directory $(Agent.TempDirectory)
+            env:
+              ServiceBus__ConnectionString: $(sbConnectionString)
+              ServiceBus__Namespace: $(serviceBusNamespace)
+
+          - task: PublishTestResults@2
+            condition: always()
+            inputs:
+              testResultsFormat: VSTest
+              testResultsFiles: $(Agent.TempDirectory)/**/*.trx
+
+  - stage: CleanupTestInfra
+    displayName: Cleanup Test Resources
+    dependsOn:
+      - ProvisionTestInfra
+      - IntegrationTests
+    condition: always()     # always clean up even on failure
+    jobs:
+      - job: DeleteResources
+        steps:
+          - task: AzureCLI@2
+            displayName: Delete test Service Bus
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az servicebus namespace delete \
+                  --resource-group $(resourceGroup) \
+                  --name $(serviceBusNamespace) \
+                  --yes \
+                  || echo "Cleanup failed (non-blocking)"
+                echo "Test infrastructure cleaned up"

@@ -1,0 +1,239 @@
+# ============================================================
+# Pipeline 74: Event-Driven Architecture Deploy
+# Complexity: Highly Complex
+# Concepts: Azure Event Grid, Azure Service Bus, Azure Functions,
+#           Logic Apps, event subscription management, dead-letter
+#           queue setup, event replay, end-to-end integration tests
+# ============================================================
+
+trigger:
+  branches:
+    include: [main]
+  paths:
+    include: [src/functions/**, infra/eventdriven/**]
+
+parameters:
+  - name: environment
+    type: string
+    default: staging
+    values: [dev, staging, prod]
+  - name: deployEventGrid
+    type: boolean
+    default: true
+  - name: deployServiceBus
+    type: boolean
+    default: true
+  - name: runIntegrationTests
+    type: boolean
+    default: true
+
+variables:
+  - group: eda-${{ parameters.environment }}-vars
+  - name: rgName
+    value: rg-eda-${{ parameters.environment }}
+  - name: location
+    value: eastus
+  - name: dotnetVersion
+    value: '8.x'
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: Build
+    displayName: Build Functions
+    jobs:
+      - job: BuildFunctions
+        steps:
+          - task: UseDotNet@2
+            inputs: { version: $(dotnetVersion) }
+
+          - bash: dotnet restore
+            workingDirectory: src/functions
+
+          - bash: dotnet build --no-restore -c Release
+            workingDirectory: src/functions
+
+          - bash: dotnet test --no-build -c Release --logger trx
+            workingDirectory: src/functions
+
+          - task: PublishTestResults@2
+            inputs:
+              testResultsFormat: VSTest
+              testResultsFiles: '**/*.trx'
+
+          - bash: dotnet publish -c Release -o $(Build.ArtifactStagingDirectory)/functions
+            workingDirectory: src/functions
+
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: $(Build.ArtifactStagingDirectory)/functions
+              artifactName: functions
+
+  - stage: InfrastructureDeploy
+    displayName: Deploy EDA Infrastructure
+    dependsOn: Build
+    jobs:
+      - deployment: DeployInfra
+        environment: ${{ parameters.environment }}
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                # Service Bus Namespace + Topics/Subscriptions
+                - ${{ if eq(parameters.deployServiceBus, true) }}:
+                  - task: AzureCLI@2
+                    displayName: Deploy Service Bus
+                    inputs:
+                      azureSubscription: sc-azure-${{ parameters.environment }}
+                      scriptType: bash
+                      scriptLocation: inlineScript
+                      inlineScript: |
+                        # Create namespace
+                        az servicebus namespace create \
+                          --resource-group $(rgName) \
+                          --name $(serviceBusNamespace) \
+                          --location $(location) \
+                          --sku Standard
+
+                        # Create topics
+                        for topic in order-created order-processed payment-completed shipment-updated; do
+                          az servicebus topic create \
+                            --resource-group $(rgName) \
+                            --namespace-name $(serviceBusNamespace) \
+                            --name $topic \
+                            --default-message-time-to-live P7D
+
+                          # Create subscription with dead-letter
+                          az servicebus topic subscription create \
+                            --resource-group $(rgName) \
+                            --namespace-name $(serviceBusNamespace) \
+                            --topic-name $topic \
+                            --name $topic-processor \
+                            --dead-letter-on-message-expiration true \
+                            --max-delivery-count 5
+                        done
+
+                        # Save connection string as output
+                        CONN=$(az servicebus namespace authorization-rule keys list \
+                          --resource-group $(rgName) \
+                          --namespace-name $(serviceBusNamespace) \
+                          --name RootManageSharedAccessKey \
+                          --query primaryConnectionString -o tsv)
+                        echo "##vso[task.setvariable variable=serviceBusConnStr;isOutput=true]$CONN"
+                    name: sbDeploy
+
+                # Event Grid – System Topic + Subscriptions
+                - ${{ if eq(parameters.deployEventGrid, true) }}:
+                  - task: AzureCLI@2
+                    displayName: Deploy Event Grid
+                    inputs:
+                      azureSubscription: sc-azure-${{ parameters.environment }}
+                      scriptType: bash
+                      scriptLocation: inlineScript
+                      inlineScript: |
+                        # Create system topic for Storage
+                        az eventgrid system-topic create \
+                          --resource-group $(rgName) \
+                          --name eda-storage-topic \
+                          --location $(location) \
+                          --topic-type Microsoft.Storage.StorageAccounts \
+                          --source $(storageAccountId)
+
+                        # Subscribe with Service Bus Queue as endpoint
+                        az eventgrid system-topic event-subscription create \
+                          --resource-group $(rgName) \
+                          --system-topic-name eda-storage-topic \
+                          --name blob-to-servicebus \
+                          --endpoint-type servicebusqueue \
+                          --endpoint $(serviceBusQueueId) \
+                          --included-event-types Microsoft.Storage.BlobCreated \
+                          --event-delivery-schema EventGridSchema \
+                          --max-delivery-attempts 3 \
+                          --event-ttl 1440
+
+                # Azure Functions Deploy
+                - task: DownloadPipelineArtifact@2
+                  inputs:
+                    artifactName: functions
+                    targetPath: $(Pipeline.Workspace)/functions
+
+                - task: AzureFunctionApp@2
+                  displayName: Deploy order-processor function
+                  inputs:
+                    azureSubscription: sc-azure-${{ parameters.environment }}
+                    appType: functionApp
+                    appName: func-order-processor-${{ parameters.environment }}
+                    package: $(Pipeline.Workspace)/functions
+
+                - task: AzureCLI@2
+                  displayName: Configure Function App Settings
+                  inputs:
+                    azureSubscription: sc-azure-${{ parameters.environment }}
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      az functionapp config appsettings set \
+                        --resource-group $(rgName) \
+                        --name func-order-processor-${{ parameters.environment }} \
+                        --settings \
+                          "ServiceBusConnection=$(serviceBusConnStr)" \
+                          "EventGridTopicEndpoint=$(eventGridEndpoint)" \
+                          "FUNCTIONS_EXTENSION_VERSION=~4" \
+                          "FUNCTIONS_WORKER_RUNTIME=dotnet-isolated"
+
+  - stage: IntegrationTests
+    displayName: End-to-End Integration Tests
+    dependsOn: InfrastructureDeploy
+    condition: and(succeeded(), eq('${{ parameters.runIntegrationTests }}', 'true'))
+    jobs:
+      - job: E2ETests
+        timeoutInMinutes: 30
+        steps:
+          - checkout: self
+
+          - task: UseDotNet@2
+            inputs: { version: $(dotnetVersion) }
+
+          - bash: |
+              dotnet test tests/IntegrationTests/ \
+                --logger trx \
+                --logger "console;verbosity=normal" \
+                --settings tests/integration.runsettings
+            displayName: Run integration tests
+            env:
+              ServiceBusConnection: $(sbDeploy.serviceBusConnStr)
+              FunctionBaseUrl: https://func-order-processor-${{ parameters.environment }}.azurewebsites.net
+
+          - task: PublishTestResults@2
+            condition: always()
+            inputs:
+              testResultsFormat: VSTest
+              testResultsFiles: '**/*.trx'
+              testRunTitle: EDA Integration Tests
+
+      - job: CheckDeadLetterQueues
+        dependsOn: E2ETests
+        steps:
+          - task: AzureCLI@2
+            displayName: Check dead-letter queue counts
+            inputs:
+              azureSubscription: sc-azure-${{ parameters.environment }}
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                for topic in order-created order-processed payment-completed shipment-updated; do
+                  COUNT=$(az servicebus topic subscription show \
+                    --resource-group $(rgName) \
+                    --namespace-name $(serviceBusNamespace) \
+                    --topic-name $topic \
+                    --name $topic-processor \
+                    --query countDetails.deadLetterMessageCount -o tsv)
+                  echo "Dead-letter count for $topic: $COUNT"
+                  if [ "$COUNT" -gt "0" ]; then
+                    echo "##vso[task.logissue type=warning]Dead-letter messages found in $topic: $COUNT"
+                  fi
+                done

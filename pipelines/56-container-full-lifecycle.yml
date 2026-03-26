@@ -1,0 +1,148 @@
+# ============================================================
+# Pipeline 56: Container Image Pipeline – Full Lifecycle
+# Complexity: Complex
+# Concepts: multi-stage Dockerfile, build args, layer caching,
+#           image scanning with Trivy + Grype, sign with Cosign,
+#           SBOM attestation, push to multiple registries
+# ============================================================
+
+trigger:
+  branches:
+    include: [main, release/*]
+
+variables:
+  acrRegistry: myacr.azurecr.io
+  dockerhubRegistry: docker.io/myorg
+  imageRepository: myapp
+  imageTag: $(Build.BuildId)
+  # Semantic version from GitVersion (simplified)
+  semVer: 1.0.$(Build.BuildId)
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: Build
+    jobs:
+      - job: BuildAndScan
+        steps:
+          - checkout: self
+
+          # Enable Docker BuildKit for cache and multi-stage
+          - bash: |
+              echo "DOCKER_BUILDKIT=1" >> /etc/environment
+              export DOCKER_BUILDKIT=1
+            displayName: Enable BuildKit
+
+          # Build image
+          - task: Docker@2
+            displayName: Build image (BuildKit)
+            inputs:
+              command: build
+              dockerfile: Dockerfile
+              repository: $(acrRegistry)/$(imageRepository)
+              tags: |
+                $(imageTag)
+                $(semVer)
+              arguments: |
+                --build-arg BUILD_DATE=$(Build.QueueTime)
+                --build-arg BUILD_COMMIT=$(Build.SourceVersion)
+                --build-arg BUILD_VERSION=$(semVer)
+                --label org.opencontainers.image.version=$(semVer)
+                --label org.opencontainers.image.revision=$(Build.SourceVersion)
+                --label org.opencontainers.image.source=$(Build.Repository.Uri)
+                --cache-from $(acrRegistry)/$(imageRepository):latest
+
+          # Trivy vulnerability scan
+          - bash: |
+              curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+                | sh -s -- -b /usr/local/bin v0.50.0
+              
+              trivy image \
+                --exit-code 0 \
+                --severity CRITICAL,HIGH \
+                --format table \
+                --output $(Agent.TempDirectory)/trivy-report.txt \
+                $(acrRegistry)/$(imageRepository):$(imageTag)
+              
+              cat $(Agent.TempDirectory)/trivy-report.txt
+            displayName: Trivy scan
+
+          # Grype vulnerability scan (alternative)
+          - bash: |
+              curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh \
+                | sh -s -- -b /usr/local/bin
+              
+              grype $(acrRegistry)/$(imageRepository):$(imageTag) \
+                --fail-on critical \
+                -o table \
+                || true
+            displayName: Grype scan
+            continueOnError: true
+
+          # Generate SBOM
+          - bash: |
+              curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+                | sh -s -- -b /usr/local/bin
+              
+              syft $(acrRegistry)/$(imageRepository):$(imageTag) \
+                -o spdx-json \
+                --file $(Agent.TempDirectory)/sbom.spdx.json
+            displayName: Generate SBOM (Syft)
+
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: $(Agent.TempDirectory)/trivy-report.txt
+              artifact: security-scan-results
+
+  - stage: Push
+    displayName: Push to Registries
+    dependsOn: Build
+    jobs:
+      - job: PushImages
+        steps:
+          # Push to ACR
+          - task: Docker@2
+            displayName: Push to ACR
+            inputs:
+              command: push
+              repository: $(acrRegistry)/$(imageRepository)
+              containerRegistry: sc-acr
+              tags: |
+                $(imageTag)
+                $(semVer)
+                latest
+
+          # Push to Docker Hub (mirror)
+          - task: Docker@2
+            displayName: Tag for Docker Hub
+            inputs:
+              command: tag
+              arguments: |
+                $(acrRegistry)/$(imageRepository):$(imageTag)
+                $(dockerhubRegistry)/$(imageRepository):$(imageTag)
+
+          - task: Docker@2
+            displayName: Push to Docker Hub
+            inputs:
+              command: push
+              repository: $(dockerhubRegistry)/$(imageRepository)
+              containerRegistry: sc-dockerhub
+              tags: |
+                $(imageTag)
+                $(semVer)
+
+          # Sign image with Cosign (keyless via OIDC)
+          - bash: |
+              curl -O -L "https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64"
+              chmod +x cosign-linux-amd64
+              sudo mv cosign-linux-amd64 /usr/local/bin/cosign
+              
+              # Keyless signing with ADO OIDC token
+              cosign sign \
+                $(acrRegistry)/$(imageRepository):$(imageTag) \
+                --yes \
+                || echo "Cosign signing failed (may need OIDC setup)"
+            displayName: Sign image with Cosign
+            continueOnError: true

@@ -1,0 +1,84 @@
+# ============================================================
+# Pipeline 19: Agentless Job – Manual Validation & Invoke REST
+# Complexity: Simple
+# Concepts: server job (agentless), ManualValidation task,
+#           InvokeRestAPI task, waiting for approval in pipeline
+# ============================================================
+
+trigger:
+  - main
+
+stages:
+
+  - stage: Build
+    jobs:
+      - job: BuildApp
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - script: echo "Building app..."
+            displayName: Build
+
+  # Agentless stage – no pool, no VM, runs on ADO service
+  - stage: WaitForApproval
+    displayName: Manual Approval Gate
+    dependsOn: Build
+    jobs:
+      # Agentless job: pool must be 'server'
+      - job: Approval
+        displayName: Wait for manual validation
+        pool: server                   # agentless (no agent)
+        timeoutInMinutes: 4320         # 72 hours to approve
+        steps:
+          # ManualValidation task pauses the pipeline and sends email
+          - task: ManualValidation@0
+            displayName: Approve to continue
+            timeoutInMinutes: 1440     # 24-hour approval window
+            inputs:
+              notifyUsers: |
+                releasemanager@mycompany.com
+                devops-team@mycompany.com
+              instructions: |
+                Please review the build artifacts and approve deployment
+                to the staging environment.
+                
+                Build: $(Build.BuildNumber)
+                Branch: $(Build.SourceBranchName)
+                Commit: $(Build.SourceVersion)
+              onTimeout: reject        # auto-reject if nobody approves in time
+
+      # Invoke external REST API (agentless)
+      - job: NotifyExternal
+        displayName: Call external API
+        pool: server
+        dependsOn: Approval
+        steps:
+          - task: InvokeRestAPI@1
+            displayName: Notify release system
+            inputs:
+              connectionType: connectedServiceName
+              serviceConnection: sc-release-api
+              method: POST
+              headers: |
+                {
+                  "Content-Type": "application/json"
+                }
+              body: |
+                {
+                  "buildId": "$(Build.BuildId)",
+                  "status": "approved",
+                  "environment": "staging"
+                }
+              successCriteria: eq(root['status'], 'accepted')
+              waitForCompletion: false
+
+  - stage: DeployStaging
+    displayName: Deploy to Staging
+    dependsOn: WaitForApproval
+    jobs:
+      - job: Deploy
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - script: echo "Deploying to Staging after approval..."
+            displayName: Deploy

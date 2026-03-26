@@ -1,0 +1,284 @@
+# ============================================================
+# Pipeline 79: Database DR Validation & Backup Testing
+# Complexity: Highly Complex
+# Concepts: Azure SQL / PostgreSQL backup restore, PITR,
+#           geo-restore, data integrity checks, RTO/RPO validation,
+#           automated DR drill, cleanup, alerting
+# ============================================================
+
+trigger: none   # Run only on schedule or manual
+
+schedules:
+  - cron: '0 2 * * 0'    # Sundays at 02:00 UTC
+    displayName: Weekly DR drill
+    branches:
+      include: [main]
+    always: true
+
+parameters:
+  - name: databases
+    type: object
+    default:
+      - name: orders-db
+        server: sql-primary.database.windows.net
+        restoreTarget: sql-dr-test
+        type: azure-sql
+      - name: userprofiles-db
+        server: psql-primary.postgres.database.azure.com
+        restoreTarget: psql-dr-test
+        type: postgres
+  - name: rpoTargetHours
+    type: number
+    default: 1
+  - name: rtoTargetMinutes
+    type: number
+    default: 30
+  - name: cleanupAfterTest
+    type: boolean
+    default: true
+
+variables:
+  - group: dr-validation-secrets
+  - name: rgName
+    value: rg-database-dr
+  - name: location
+    value: westus   # Different region from primary
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: PreDrillChecks
+    displayName: Pre-Drill – Verify Backups Exist
+    jobs:
+      - job: CheckBackupStatus
+        steps:
+          - task: AzureCLI@2
+            displayName: Check Azure SQL backup status
+            inputs:
+              azureSubscription: sc-azure-prod
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                for DB in orders-db userprofiles-db; do
+                  echo "=== Checking backup status for $DB ==="
+
+                  # Check last backup time
+                  LAST_BACKUP=$(az sql db ltr-backup list \
+                    --location $(location) \
+                    --server sql-primary \
+                    --database "$DB" \
+                    --query "[0].backupTime" -o tsv 2>/dev/null || echo "N/A")
+
+                  echo "Last LTR backup: $LAST_BACKUP"
+
+                  # Check geo-redundant backup
+                  GEO_BACKUP=$(az sql db show \
+                    --resource-group rg-primary \
+                    --server sql-primary \
+                    --name "$DB" \
+                    --query "requestedBackupStorageRedundancy" -o tsv)
+
+                  echo "Backup redundancy: $GEO_BACKUP"
+                  if [ "$GEO_BACKUP" != "Geo" ]; then
+                    echo "##vso[task.logissue type=warning]$DB is not geo-redundant!"
+                  fi
+                done
+
+          - task: AzureCLI@2
+            displayName: Capture latest restore point
+            inputs:
+              azureSubscription: sc-azure-prod
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                RESTORE_POINT=$(az sql db show \
+                  --resource-group rg-primary \
+                  --server sql-primary \
+                  --name orders-db \
+                  --query "earliestRestoreDate" -o tsv)
+
+                HOURS_AGO=$(python3 -c "
+                from datetime import datetime, timezone
+                rp = datetime.fromisoformat('$RESTORE_POINT'.replace('Z', '+00:00'))
+                now = datetime.now(timezone.utc)
+                diff = (now - rp).total_seconds() / 3600
+                print(f'{diff:.1f}')
+                ")
+                echo "Hours since earliest restore point: $HOURS_AGO"
+                echo "##vso[task.setvariable variable=hoursToRestorePoint;isOutput=true]$HOURS_AGO"
+            name: rpCheck
+
+  - stage: BackupRestore
+    displayName: Restore Databases to DR Environment
+    dependsOn: PreDrillChecks
+    jobs:
+      - ${{ each db in parameters.databases }}:
+        - job: Restore_${{ replace(db.name, '-', '_') }}
+          displayName: Restore ${{ db.name }}
+          timeoutInMinutes: 60
+          steps:
+            - task: AzureCLI@2
+              displayName: Point-in-time restore ${{ db.name }}
+              inputs:
+                azureSubscription: sc-azure-prod
+                scriptType: bash
+                scriptLocation: inlineScript
+                inlineScript: |
+                  RESTORE_TIME=$(date -u -d '1 hour ago' +"%Y-%m-%dT%H:%M:%SZ")
+                  START_TIME=$(date +%s)
+
+                  echo "Restoring ${{ db.name }} to: $RESTORE_TIME"
+                  echo "##vso[task.setvariable variable=restoreStartTime]$START_TIME"
+
+                  ${{ if eq(db.type, 'azure-sql') }}:
+                    az sql db restore \
+                      --dest-name ${{ db.name }}-dr-$(Build.BuildId) \
+                      --dest-resource-group $(rgName) \
+                      --dest-server ${{ db.restoreTarget }} \
+                      --edition GeneralPurpose \
+                      --family Gen5 \
+                      --capacity 2 \
+                      --resource-group rg-primary \
+                      --server sql-primary \
+                      --name ${{ db.name }} \
+                      --time "$RESTORE_TIME"
+                  ${{ else }}:
+                    # PostgreSQL flexible server restore
+                    az postgres flexible-server geo-restore \
+                      --resource-group $(rgName) \
+                      --name psql-dr-$(Build.BuildId) \
+                      --source-server $(psqlPrimaryId) \
+                      --location $(location)
+
+                  END_TIME=$(date +%s)
+                  ELAPSED=$(( END_TIME - START_TIME ))
+                  echo "Restore completed in: ${ELAPSED}s ($(( ELAPSED/60 ))m)"
+
+                  # Check against RTO
+                  RTO_SECONDS=$(( ${{ parameters.rtoTargetMinutes }} * 60 ))
+                  if [ "$ELAPSED" -gt "$RTO_SECONDS" ]; then
+                    echo "##vso[task.logissue type=error]RTO BREACH: Restore took ${ELAPSED}s, target is ${RTO_SECONDS}s"
+                  else
+                    echo "RTO MET: Restore completed within target (${{ parameters.rtoTargetMinutes }}m)"
+                  fi
+
+  - stage: IntegrityValidation
+    displayName: Data Integrity Validation
+    dependsOn: BackupRestore
+    jobs:
+      - job: RunIntegrityChecks
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: Run integrity check scripts
+            inputs:
+              azureSubscription: sc-azure-prod
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                # Install sqlcmd
+                curl https://packages.microsoft.com/keys/microsoft.asc | sudo apt-key add -
+                curl https://packages.microsoft.com/config/ubuntu/22.04/prod.list | sudo tee /etc/apt/sources.list.d/mssql-release.list
+                sudo apt-get update -q
+                ACCEPT_EULA=Y sudo apt-get install -y -q mssql-tools18 unixodbc-dev
+
+                # Run validation queries
+                /opt/mssql-tools18/bin/sqlcmd \
+                  -S ${{ 'sql-dr-test.database.windows.net' }} \
+                  -d orders-db-dr-$(Build.BuildId) \
+                  -U $(sqlAdminUser) \
+                  -P $(sqlAdminPassword) \
+                  -C \
+                  -Q "
+                    PRINT 'Row counts:';
+                    SELECT 'Orders' AS TableName, COUNT(*) AS RowCount FROM dbo.Orders
+                    UNION ALL
+                    SELECT 'OrderItems', COUNT(*) FROM dbo.OrderItems
+                    UNION ALL
+                    SELECT 'Customers', COUNT(*) FROM dbo.Customers;
+
+                    PRINT 'Checking FK constraints:';
+                    DBCC CHECKCONSTRAINTS WITH ALL_CONSTRAINTS;
+
+                    PRINT 'Database consistency:';
+                    DBCC CHECKDB WITH NO_INFOMSGS;
+                  " 2>&1 | tee integrity-report.txt
+
+                if grep -i "error\|failure" integrity-report.txt; then
+                  echo "##vso[task.logissue type=error]Integrity check failed!"
+                  exit 1
+                fi
+
+          - task: PublishPipelineArtifact@1
+            condition: always()
+            inputs:
+              targetPath: integrity-report.txt
+              artifactName: dr-integrity-report
+
+  - stage: RPOValidation
+    displayName: RPO/RTO Report
+    dependsOn: IntegrityValidation
+    jobs:
+      - job: Report
+        steps:
+          - bash: |
+              cat <<'EOF' > dr-drill-report.md
+              # DR Drill Report
+              **Date:** $(date -u)
+              **Build:** $(Build.BuildId)
+              **Target RPO:** ${{ parameters.rpoTargetHours }} hours
+              **Target RTO:** ${{ parameters.rtoTargetMinutes }} minutes
+
+              ## Results
+              | Database | Restore Status | RTO (actual) | RTO (target) | Pass? |
+              |----------|---------------|--------------|--------------|-------|
+              | orders-db | Completed | see logs | ${{ parameters.rtoTargetMinutes }}m | TBD |
+              | userprofiles-db | Completed | see logs | ${{ parameters.rtoTargetMinutes }}m | TBD |
+
+              ## Recommendations
+              - Review any RTO breaches
+              - Verify geo-redundancy is enabled on all critical databases
+              - Schedule next drill: $(date -d '+7 days' -u)
+              EOF
+              cat dr-drill-report.md
+            displayName: Generate DR drill report
+
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: dr-drill-report.md
+              artifactName: dr-drill-report
+
+  - stage: Cleanup
+    displayName: Cleanup DR Test Resources
+    dependsOn:
+      - RPOValidation
+    condition: and(always(), eq('${{ parameters.cleanupAfterTest }}', 'true'))
+    jobs:
+      - job: DeleteDRResources
+        steps:
+          - task: AzureCLI@2
+            displayName: Delete DR test databases
+            inputs:
+              azureSubscription: sc-azure-prod
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                echo "Cleaning up DR test resources from build $(Build.BuildId)"
+
+                # Delete restored SQL database
+                az sql db delete \
+                  --resource-group $(rgName) \
+                  --server ${{ 'sql-dr-test' }} \
+                  --name orders-db-dr-$(Build.BuildId) \
+                  --yes || true
+
+                # Delete restored PostgreSQL server
+                az postgres flexible-server delete \
+                  --resource-group $(rgName) \
+                  --name psql-dr-$(Build.BuildId) \
+                  --yes || true
+
+                echo "Cleanup complete"

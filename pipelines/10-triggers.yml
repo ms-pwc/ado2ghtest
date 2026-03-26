@@ -1,0 +1,113 @@
+# ============================================================
+# Pipeline 10: Triggers – All Trigger Types
+# Concepts: CI triggers (include/exclude branches & paths),
+#           PR triggers, scheduled (cron) triggers,
+#           pipeline resource triggers, tag triggers,
+#           disabling triggers
+# ============================================================
+
+# ── CI Trigger ────────────────────────────────────────────────
+# Runs on push to these branches, filtered by path
+trigger:
+  batch: true              # batch commits that arrive while pipeline runs
+  branches:
+    include:
+      - main
+      - release/*
+      - hotfix/*
+    exclude:
+      - feature/experimental*  # never trigger on experimental features
+  paths:
+    include:
+      - src/**               # only trigger when src/ changes
+      - tests/**
+    exclude:
+      - docs/**              # ignore documentation-only changes
+      - '**/*.md'
+  tags:
+    include:
+      - v*                   # also trigger on version tags (v1.0.0 etc.)
+
+# ── Pull Request Trigger ─────────────────────────────────────
+pr:
+  branches:
+    include:
+      - main
+      - develop
+    exclude:
+      - release/*            # PRs into release branches handled separately
+  paths:
+    include:
+      - src/**
+  drafts: false             # do NOT run on draft PRs
+
+# ── Scheduled (Cron) Triggers ────────────────────────────────
+schedules:
+  # Nightly full build on main at 02:00 UTC Mon–Fri
+  - cron: '0 2 * * 1-5'
+    displayName: Nightly build (weekdays)
+    branches:
+      include:
+        - main
+    always: true            # run even if code hasn't changed
+
+  # Weekly regression run on Sunday at 04:00 UTC
+  - cron: '0 4 * * 0'
+    displayName: Weekly regression (Sunday)
+    branches:
+      include:
+        - main
+        - release/*
+    always: false           # skip if no changes since last run
+
+# ── Resources – Pipeline Trigger ─────────────────────────────
+# This pipeline is also triggered when another pipeline completes
+resources:
+  pipelines:
+    - pipeline: upstreamBuild          # local alias
+      source: MyApp-CI                 # name of the triggering pipeline
+      project: MyProject               # ADO project (omit if same project)
+      trigger:
+        branches:
+          include:
+            - main                     # only when upstreamBuild ran on main
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: DetectTrigger
+    displayName: Detect & Print Trigger Info
+    jobs:
+      - job: TriggerInfo
+        steps:
+          - script: |
+              echo "=== Trigger Information ==="
+              echo "Build.Reason           : $(Build.Reason)"
+              echo "Build.SourceBranch     : $(Build.SourceBranch)"
+              echo "Build.SourceBranchName : $(Build.SourceBranchName)"
+              echo "Build.SourceVersion    : $(Build.SourceVersion)"
+              echo "System.PullRequest.Id  : $(System.PullRequest.PullRequestId)"
+              echo "Schedule.DisplayName   : $(Schedule.DisplayName)"
+            displayName: Print trigger details
+
+          # Run extra steps only for scheduled triggers
+          - script: echo "This is a scheduled run – cleaning up old artifacts..."
+            displayName: Scheduled-only cleanup
+            condition: eq(variables['Build.Reason'], 'Schedule')
+
+          # PR-specific step
+          - script: echo "Validating PR #$(System.PullRequest.PullRequestId)"
+            displayName: PR validation step
+            condition: eq(variables['Build.Reason'], 'PullRequest')
+
+          # Tag-triggered step
+          - script: echo "Tagged release build – creating release notes"
+            displayName: Release notes generation
+            condition: startsWith(variables['Build.SourceBranch'], 'refs/tags/v')
+
+          # Upstream pipeline triggered step
+          - script: echo "Triggered by upstream pipeline – running integration suite"
+            displayName: Upstream-triggered integration
+            condition: eq(variables['Build.Reason'], 'ResourceTrigger')

@@ -1,0 +1,190 @@
+# ============================================================
+# Pipeline 72: Multi-Tenant SaaS Deployment
+# Complexity: Highly Complex
+# Concepts: tenant iteration via each, per-tenant config,
+#           tenant isolation, parallel tenant deploys,
+#           smoke test per tenant, tenant onboarding
+# ============================================================
+
+trigger:
+  branches:
+    include: [main]
+
+parameters:
+  - name: tenants
+    type: object
+    default:
+      - id: tenant-alpha
+        displayName: Alpha Corp
+        region: eastus
+        tier: premium
+        resourceGroup: rg-saas-alpha
+        appName: saas-alpha
+        dbName: db-alpha
+      - id: tenant-beta
+        displayName: Beta Inc
+        region: westeurope
+        tier: standard
+        resourceGroup: rg-saas-beta
+        appName: saas-beta
+        dbName: db-beta
+      - id: tenant-gamma
+        displayName: Gamma LLC
+        region: southeastasia
+        tier: standard
+        resourceGroup: rg-saas-gamma
+        appName: saas-gamma
+        dbName: db-gamma
+
+  - name: deployAllTenants
+    type: boolean
+    default: true
+
+  - name: skipMigration
+    type: boolean
+    default: false
+
+variables:
+  azureServiceConnection: sc-azure-saas
+  containerRegistry: myacr.azurecr.io
+  imageTag: $(Build.BuildId)
+  buildConfiguration: Release
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: Build
+    displayName: Build SaaS Application
+    jobs:
+      - job: BuildAndPush
+        steps:
+          - checkout: self
+
+          - task: Docker@2
+            displayName: Build & push SaaS image
+            inputs:
+              command: buildAndPush
+              repository: $(containerRegistry)/saas-app
+              containerRegistry: sc-acr
+              tags: |
+                $(imageTag)
+                latest
+              dockerfile: src/SaaS.Api/Dockerfile
+
+          - task: DotNetCoreCLI@2
+            displayName: Publish migration bundle
+            inputs:
+              command: run
+              projects: src/SaaS.Migrations/SaaS.Migrations.csproj
+              arguments: '-- bundle --output $(Build.ArtifactStagingDirectory)/migrations'
+            continueOnError: true
+
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: $(Build.ArtifactStagingDirectory)/migrations
+              artifact: db-migrations
+
+  - stage: DeployTenants
+    displayName: Deploy All Tenants
+    dependsOn: Build
+    jobs:
+      # Generate one deployment job per tenant using each
+      - ${{ each tenant in parameters.tenants }}:
+        - deployment: Deploy_${{ replace(tenant.id, '-', '_') }}
+          displayName: Deploy ${{ tenant.displayName }} (${{ tenant.tier }})
+          environment: saas-production/${{ tenant.id }}
+          pool:
+            vmImage: ubuntu-latest
+          strategy:
+            runOnce:
+              deploy:
+                steps:
+                  # Configure tenant-specific app settings
+                  - task: AzureCLI@2
+                    displayName: Configure ${{ tenant.displayName }} settings
+                    inputs:
+                      azureSubscription: $(azureServiceConnection)
+                      scriptType: bash
+                      scriptLocation: inlineScript
+                      inlineScript: |
+                        az webapp config appsettings set \
+                          --resource-group ${{ tenant.resourceGroup }} \
+                          --name ${{ tenant.appName }} \
+                          --settings \
+                            TENANT_ID="${{ tenant.id }}" \
+                            TENANT_TIER="${{ tenant.tier }}" \
+                            IMAGE_TAG="$(imageTag)" \
+                            ASPNETCORE_ENVIRONMENT="Production"
+
+                  # Run DB migrations for this tenant
+                  - ${{ if not(parameters.skipMigration) }}:
+                    - task: AzureCLI@2
+                      displayName: Migrate ${{ tenant.dbName }}
+                      inputs:
+                        azureSubscription: $(azureServiceConnection)
+                        scriptType: bash
+                        scriptLocation: inlineScript
+                        inlineScript: |
+                          CONN=$(az keyvault secret show \
+                            --vault-name saas-keyvault \
+                            --name "db-conn-${{ tenant.id }}" \
+                            --query value -o tsv)
+                          
+                          echo "Migrating database: ${{ tenant.dbName }}"
+                          # $(Pipeline.Workspace)/db-migrations/efbundle --connection "$CONN"
+                          echo "Migration complete for ${{ tenant.id }}"
+
+                  # Deploy new image to tenant's container
+                  - task: AzureWebApp@1
+                    displayName: Deploy to ${{ tenant.appName }}
+                    inputs:
+                      azureSubscription: $(azureServiceConnection)
+                      appType: webAppContainer
+                      appName: ${{ tenant.appName }}
+                      containers: $(containerRegistry)/saas-app:$(imageTag)
+
+                  # Per-tenant smoke test
+                  - bash: |
+                      URL="https://${{ tenant.appName }}.azurewebsites.net"
+                      for i in $(seq 1 10); do
+                        STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL/health")
+                        [ "$STATUS" = "200" ] && echo "${{ tenant.displayName }}: healthy ✓" && exit 0
+                        echo "Attempt $i: $STATUS"
+                        sleep 10
+                      done
+                      echo "${{ tenant.displayName }}: Health check FAILED"
+                      exit 1
+                    displayName: Smoke test ${{ tenant.displayName }}
+
+  - stage: TenantValidation
+    displayName: Cross-Tenant Validation
+    dependsOn: DeployTenants
+    jobs:
+      - job: ValidateAll
+        steps:
+          - bash: |
+              echo "=== Tenant Deployment Summary ==="
+              ${{ each tenant in parameters.tenants }}:
+              echo "${{ tenant.displayName }} (${{ tenant.id }}): ${{ stageDependencies.DeployTenants.Deploy_${{ replace(tenant.id, '-', '_') }}.result }}"
+            displayName: Print deployment summary
+
+  - stage: TenantMetricsRollup
+    displayName: Aggregate Tenant Metrics
+    dependsOn: TenantValidation
+    jobs:
+      - job: MetricsRollup
+        steps:
+          - task: AzureCLI@2
+            displayName: Query per-tenant metrics
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                echo "=== Post-Deploy Tenant Health ==="
+                ${{ each tenant in parameters.tenants }}:
+                printf "%-20s" "${{ tenant.displayName }}"
+                curl -s -o /dev/null -w "HTTP %{http_code}\n" \
+                  "https://${{ tenant.appName }}.azurewebsites.net/health" || echo "UNREACHABLE"

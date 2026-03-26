@@ -1,0 +1,119 @@
+# ============================================================
+# Pipeline 02: Multi-Stage Pipeline
+# Concepts: stages, jobs, steps, dependsOn, pool per-job,
+#           stage-level variables, job outputs, success/failure
+# ============================================================
+
+trigger:
+  branches:
+    include:
+      - main
+
+# ----- Stage-level variables (override per stage below) -----
+variables:
+  buildConfiguration: Release
+  dotnetVersion: '8.x'
+
+stages:
+
+  # ── Stage 1: Build ──────────────────────────────────────────
+  - stage: Build
+    displayName: Build Stage
+    variables:
+      stageName: build   # stage-scoped variable
+    jobs:
+      - job: CompileAndTest
+        displayName: Compile & Unit Test
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: self
+
+          - task: UseDotNet@2
+            displayName: Install .NET $(dotnetVersion)
+            inputs:
+              packageType: sdk
+              version: $(dotnetVersion)
+
+          - script: dotnet build --configuration $(buildConfiguration)
+            displayName: dotnet build
+
+          - script: dotnet test --no-build --configuration $(buildConfiguration) --logger trx
+            displayName: dotnet test
+
+          - task: PublishTestResults@2
+            displayName: Publish test results
+            condition: succeededOrFailed()
+            inputs:
+              testResultsFormat: VSTest
+              testResultsFiles: '**/*.trx'
+
+          # Output variable consumed by the next job
+          - bash: echo "##vso[task.setvariable variable=artifactName;isOutput=true]drop-$(Build.BuildId)"
+            name: setVars
+            displayName: Set output variable
+
+      # Second job in same stage, runs AFTER CompileAndTest
+      - job: CodeAnalysis
+        displayName: Static Code Analysis
+        dependsOn: CompileAndTest
+        pool:
+          vmImage: windows-latest   # different OS per job
+        steps:
+          - checkout: self
+          - script: echo "Running linters and SAST tools..."
+            displayName: Run analysis
+
+  # ── Stage 2: Package ────────────────────────────────────────
+  - stage: Package
+    displayName: Package Stage
+    dependsOn: Build                # only starts after Build succeeds
+    condition: succeeded('Build')
+    jobs:
+      - job: PublishArtifact
+        displayName: Create & Publish Artifact
+        pool:
+          vmImage: ubuntu-latest
+        # Read the output variable from the previous stage
+        variables:
+          artifactName: $[ stageDependencies.Build.CompileAndTest.outputs['setVars.artifactName'] ]
+        steps:
+          - checkout: self
+
+          - script: dotnet publish --configuration $(buildConfiguration) --output $(Build.ArtifactStagingDirectory)
+            displayName: dotnet publish
+
+          - task: PublishBuildArtifacts@1
+            displayName: Publish build artifact
+            inputs:
+              pathToPublish: $(Build.ArtifactStagingDirectory)
+              artifactName: $(artifactName)
+              publishLocation: Container
+
+  # ── Stage 3: Deploy to QA ────────────────────────────────────
+  - stage: DeployQA
+    displayName: Deploy to QA
+    dependsOn: Package
+    condition: and(succeeded(), eq(variables['Build.SourceBranchName'], 'main'))
+    jobs:
+      - job: DeployJob
+        displayName: Deploy app to QA environment
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - script: echo "Deploying to QA..."
+            displayName: Deploy to QA
+
+  # ── Stage 4: Deploy to Prod ──────────────────────────────────
+  - stage: DeployProd
+    displayName: Deploy to Production
+    dependsOn: DeployQA
+    condition: succeeded('DeployQA')
+    jobs:
+      - job: ProdDeploy
+        displayName: Production deployment
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - script: echo "Deploying to Production..."
+            displayName: Deploy to Prod

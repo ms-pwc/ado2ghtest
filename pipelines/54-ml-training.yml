@@ -1,0 +1,165 @@
+# ============================================================
+# Pipeline 54: ML Model Training – Azure Machine Learning
+# Complexity: Complex
+# Concepts: AzureML CLI v2, model training job, data asset,
+#           model registration, endpoint deployment,
+#           training metrics logging
+# ============================================================
+
+trigger:
+  branches:
+    include: [main]
+  paths:
+    include: [ml/**]
+
+variables:
+  azureServiceConnection: sc-azure-ml
+  amlWorkspace: myapp-aml-workspace
+  resourceGroup: rg-ml-prod
+  subscriptionId: $(ARM_SUBSCRIPTION_ID)
+  trainingScript: ml/train.py
+  modelName: myapp-classifier
+  computeCluster: gpu-cluster
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: DataValidation
+    displayName: Validate Training Data
+    jobs:
+      - job: ValidateData
+        steps:
+          - checkout: self
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: '3.11'
+          - script: pip install azureml-sdk pandas scikit-learn
+            displayName: Install ML deps
+          - script: |
+              python ml/validate_data.py \
+                --data-path ml/data \
+                --schema ml/schema.json
+            displayName: Validate data schema & quality
+
+  - stage: TrainModel
+    displayName: Train ML Model
+    dependsOn: DataValidation
+    jobs:
+      - job: AMLTrain
+        timeoutInMinutes: 240     # training can take long
+        steps:
+          - checkout: self
+
+          # Install Azure ML CLI v2
+          - task: AzureCLI@2
+            displayName: Install Azure ML extension
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az extension add -n ml --yes
+                az ml --version
+
+          # Submit training job to Azure ML
+          - task: AzureCLI@2
+            displayName: Submit AML training job
+            name: trainJob
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                JOB_NAME=$(az ml job create \
+                  --resource-group $(resourceGroup) \
+                  --workspace-name $(amlWorkspace) \
+                  --file ml/train-job.yml \
+                  --set \
+                    inputs.training_data.path=azureml:training-data@latest \
+                    environment_variables.BUILD_ID=$(Build.BuildId) \
+                  --query name -o tsv)
+                
+                echo "Job submitted: $JOB_NAME"
+                echo "##vso[task.setvariable variable=jobName;isOutput=true]$JOB_NAME"
+
+          # Stream training logs
+          - task: AzureCLI@2
+            displayName: Stream training logs
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az ml job stream \
+                  --resource-group $(resourceGroup) \
+                  --workspace-name $(amlWorkspace) \
+                  --name $(trainJob.jobName) \
+                  || true
+
+          # Check job status and get metrics
+          - task: AzureCLI@2
+            displayName: Evaluate training metrics
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                STATUS=$(az ml job show \
+                  --resource-group $(resourceGroup) \
+                  --workspace-name $(amlWorkspace) \
+                  --name $(trainJob.jobName) \
+                  --query status -o tsv)
+                
+                echo "Training job status: $STATUS"
+                [ "$STATUS" = "Completed" ] || { echo "Training failed"; exit 1; }
+                
+                # Get accuracy metric
+                az ml job show \
+                  --resource-group $(resourceGroup) \
+                  --workspace-name $(amlWorkspace) \
+                  --name $(trainJob.jobName) \
+                  --query metrics
+
+  - stage: RegisterModel
+    displayName: Register & Deploy Model
+    dependsOn: TrainModel
+    jobs:
+      - deployment: ModelDeploy
+        environment: production
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                # Register the trained model
+                - task: AzureCLI@2
+                  displayName: Register model
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      az ml model create \
+                        --resource-group $(resourceGroup) \
+                        --workspace-name $(amlWorkspace) \
+                        --name $(modelName) \
+                        --version $(Build.BuildId) \
+                        --path azureml://jobs/$(trainJob.jobName)/outputs/model \
+                        --type mlflow_model
+
+                # Deploy to managed online endpoint
+                - task: AzureCLI@2
+                  displayName: Deploy to online endpoint
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      az ml online-deployment create \
+                        --resource-group $(resourceGroup) \
+                        --workspace-name $(amlWorkspace) \
+                        --endpoint-name $(modelName)-endpoint \
+                        --file ml/deployment.yml \
+                        --set model=azureml:$(modelName):$(Build.BuildId) \
+                        --all-traffic

@@ -1,0 +1,252 @@
+# ============================================================
+# Pipeline 88: Power Platform ALM (Power Apps + Power Automate)
+# Complexity: Highly Complex
+# Concepts: Power Platform CLI (pac), solution export/import,
+#           managed vs unmanaged solutions, environment variables,
+#           connection references, canvas app publishing,
+#           approval flow deployment, DLP policy validation,
+#           solution checker (static analysis)
+# ============================================================
+
+trigger:
+  branches:
+    include: [main]
+  paths:
+    include: [powerplatform/**, solutions/**]
+
+parameters:
+  - name: solutionName
+    type: string
+    default: MyEnterpriseSolution
+  - name: sourceEnvironment
+    type: string
+    default: dev
+    displayName: Source environment to export from
+  - name: targetEnvironments
+    type: object
+    default:
+      - name: test
+        url: https://org-test.crm.dynamics.com
+        envVarFile: powerplatform/env-test.json
+      - name: prod
+        url: https://org-prod.crm.dynamics.com
+        envVarFile: powerplatform/env-prod.json
+  - name: runSolutionChecker
+    type: boolean
+    default: true
+
+variables:
+  - group: power-platform-vars
+  - name: pacVersion
+    value: '1.27.6'
+  - name: solutionZip
+    value: $(Build.ArtifactStagingDirectory)/$(solutionName).zip
+  - name: solutionManagedZip
+    value: $(Build.ArtifactStagingDirectory)/$(solutionName)_managed.zip
+
+pool:
+  vmImage: windows-latest    # Power Platform CLI runs best on Windows
+
+stages:
+
+  - stage: ExportSolution
+    displayName: Export Solution from Dev
+    jobs:
+      - job: Export
+        steps:
+          - checkout: self
+
+          # Install Power Platform CLI
+          - pwsh: |
+              $pacUrl = "https://aka.ms/PowerAppsCLI"
+              Invoke-WebRequest -Uri $pacUrl -OutFile pac.msi
+              Start-Process msiexec.exe -Wait -ArgumentList '/i pac.msi /quiet'
+              $env:PATH = "C:\Program Files\Microsoft Power Platform CLI;" + $env:PATH
+              pac --version
+            displayName: Install Power Platform CLI
+
+          - pwsh: |
+              # Authenticate to source environment
+              pac auth create `
+                --url "https://org-$(parameters.sourceEnvironment).crm.dynamics.com" `
+                --applicationId $(powerPlatformClientId) `
+                --clientSecret $(powerPlatformClientSecret) `
+                --tenant $(tenantId) `
+                --name "source-env"
+
+              # Export unmanaged solution
+              pac solution export `
+                --name "${{ parameters.solutionName }}" `
+                --path "$(solutionZip)" `
+                --overwrite
+
+              Write-Host "Exported unmanaged solution"
+              Write-Host "##vso[task.setvariable variable=solutionExported;isOutput=true]true"
+            name: exportSolution
+            displayName: Export solution (unmanaged)
+
+          - pwsh: |
+              # Export managed solution (for deployment)
+              pac solution export `
+                --name "${{ parameters.solutionName }}" `
+                --path "$(solutionManagedZip)" `
+                --managed `
+                --overwrite
+              Write-Host "Exported managed solution"
+            displayName: Export solution (managed)
+
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: $(Build.ArtifactStagingDirectory)
+              artifactName: solutions
+
+  - stage: SolutionChecker
+    displayName: Power Platform Solution Checker
+    dependsOn: ExportSolution
+    condition: and(succeeded(), eq('${{ parameters.runSolutionChecker }}', 'true'))
+    jobs:
+      - job: RunChecker
+        steps:
+          - task: DownloadPipelineArtifact@2
+            inputs:
+              artifactName: solutions
+              targetPath: $(Pipeline.Workspace)/solutions
+
+          - pwsh: |
+              pac auth create `
+                --applicationId $(powerPlatformClientId) `
+                --clientSecret $(powerPlatformClientSecret) `
+                --tenant $(tenantId) `
+                --name "checker-auth"
+
+              # Run solution checker
+              pac solution check `
+                --path "$(Pipeline.Workspace)/solutions/${{ parameters.solutionName }}.zip" `
+                --outputDirectory "$(Build.ArtifactStagingDirectory)/checker-results" `
+                --geo UnitedStates
+
+              Write-Host "Solution checker complete"
+            displayName: Run solution checker
+
+          - pwsh: |
+              # Parse results and fail on High/Critical issues
+              $resultsPath = "$(Build.ArtifactStagingDirectory)/checker-results"
+              $resultsFile = Get-ChildItem $resultsPath -Filter "*.json" | Select-Object -First 1
+              if ($resultsFile) {
+                $results = Get-Content $resultsFile.FullName | ConvertFrom-Json
+                $critical = $results.issues | Where-Object { $_.severity -eq "Critical" }
+                $high = $results.issues | Where-Object { $_.severity -eq "High" }
+                
+                Write-Host "Critical issues: $($critical.Count)"
+                Write-Host "High issues: $($high.Count)"
+                
+                if ($critical.Count -gt 0 -or $high.Count -gt 0) {
+                  Write-Host "##vso[task.logissue type=error]Solution checker found $($critical.Count) critical and $($high.Count) high severity issues!"
+                  exit 1
+                }
+              }
+            displayName: Evaluate checker results
+
+          - task: PublishPipelineArtifact@1
+            condition: always()
+            inputs:
+              targetPath: $(Build.ArtifactStagingDirectory)/checker-results
+              artifactName: solution-checker-results
+
+  - stage: UnpackAndCommit
+    displayName: Unpack Solution & Commit to Source Control
+    dependsOn: SolutionChecker
+    condition: succeeded()
+    jobs:
+      - job: UnpackCommit
+        steps:
+          - checkout: self
+            persistCredentials: true
+          - task: DownloadPipelineArtifact@2
+            inputs:
+              artifactName: solutions
+              targetPath: $(Pipeline.Workspace)/solutions
+
+          - pwsh: |
+              # Unpack solution to source-controlled folder
+              pac solution unpack `
+                --zipfile "$(Pipeline.Workspace)/solutions/${{ parameters.solutionName }}.zip" `
+                --folder "solutions/${{ parameters.solutionName }}" `
+                --processCanvasApps `
+                --allowDelete
+
+              Write-Host "Solution unpacked"
+            displayName: Unpack solution to source control
+
+          - pwsh: |
+              git config user.email "pp-bot@$(orgDomain)"
+              git config user.name "Power Platform Bot"
+              git add solutions/
+              $hasDiff = git diff --cached --quiet; $LASTEXITCODE -ne 0
+              if ($hasDiff) {
+                git commit -m "chore(powerplatform): sync ${{ parameters.solutionName }} solution [skip ci]"
+                git push
+                Write-Host "Solution committed"
+              } else {
+                Write-Host "No changes to commit"
+              }
+            displayName: Commit unpacked solution
+
+  - stage: DeployToTargets
+    displayName: Deploy to Target Environments
+    dependsOn: UnpackAndCommit
+    jobs:
+      - ${{ each env in parameters.targetEnvironments }}:
+        - deployment: Deploy_${{ env.name }}
+          displayName: Import to ${{ env.name }}
+          environment: powerplatform-${{ env.name }}
+          strategy:
+            runOnce:
+              deploy:
+                steps:
+                  - task: DownloadPipelineArtifact@2
+                    inputs:
+                      artifactName: solutions
+                      targetPath: $(Pipeline.Workspace)/solutions
+
+                  - checkout: self
+
+                  - pwsh: |
+                      # Authenticate to target environment
+                      pac auth create `
+                        --url "${{ env.url }}" `
+                        --applicationId $(powerPlatformClientId) `
+                        --clientSecret $(powerPlatformClientSecret) `
+                        --tenant $(tenantId) `
+                        --name "target-${{ env.name }}"
+
+                      # Import managed solution
+                      pac solution import `
+                        --path "$(Pipeline.Workspace)/solutions/${{ parameters.solutionName }}_managed.zip" `
+                        --environmentVariabelDefinitionFile "${{ env.envVarFile }}" `
+                        --activatePlugins `
+                        --overwriteUnmanagedCustomizations
+
+                      Write-Host "${{ parameters.solutionName }} imported to ${{ env.name }}"
+                    displayName: Import managed solution
+
+                  - pwsh: |
+                      # Apply connection references
+                      $envVars = Get-Content "${{ env.envVarFile }}" | ConvertFrom-Json
+                      foreach ($connRef in $envVars.connectionReferences) {
+                        Write-Host "Updating connection reference: $($connRef.logicalName)"
+                        pac connection update `
+                          --solutionName "${{ parameters.solutionName }}" `
+                          --connectorId $connRef.connectorId `
+                          --connectionId $connRef.connectionId || true
+                      }
+                    displayName: Apply connection references
+
+                  - pwsh: |
+                      # Publish canvas apps
+                      pac canvas pack \
+                        --sources "solutions/${{ parameters.solutionName }}/CanvasApps" `
+                        || Write-Host "No canvas apps to publish"
+
+                      Write-Host "Deployment to ${{ env.name }} complete"
+                    displayName: Finalize deployment

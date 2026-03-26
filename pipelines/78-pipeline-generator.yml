@@ -1,0 +1,253 @@
+# ============================================================
+# Pipeline 78: Dynamic Pipeline Generator
+# Complexity: Highly Complex
+# Concepts: Runtime YAML generation via Node.js script,
+#           ADO REST API to queue child pipelines dynamically,
+#           configuration-driven builds, composite run steps,
+#           JSON/YAML templating, pipeline-as-code patterns
+# ============================================================
+
+trigger:
+  branches:
+    include: [main]
+  paths:
+    include: [config/services.json, generator/**]
+
+parameters:
+  - name: configFile
+    type: string
+    default: config/services.json
+  - name: dryRun
+    type: boolean
+    default: false
+  - name: targetEnvironment
+    type: string
+    default: staging
+    values: [dev, staging, prod]
+  - name: filter
+    type: string
+    default: ''
+    displayName: 'Filter services by name (empty = all)'
+
+variables:
+  - group: pipeline-generator-vars
+  - name: adoOrg
+    value: https://dev.azure.com/$(adoOrgName)
+  - name: adoProject
+    value: $(adoProjectName)
+  - name: generatorDir
+    value: generator
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: ReadConfiguration
+    displayName: Read & Validate Config
+    jobs:
+      - job: ValidateConfig
+        steps:
+          - checkout: self
+
+          - bash: |
+              node --version
+              npm --version
+            displayName: Check Node.js
+
+          - bash: |
+              cd $(generatorDir)
+              npm ci
+            displayName: Install generator dependencies
+
+          - bash: |
+              cd $(generatorDir)
+              node validate-config.js \
+                --config ../$(configFile) \
+                --schema schemas/services.schema.json
+            displayName: Validate config schema
+
+          - bash: |
+              cd $(generatorDir)
+              SERVICE_COUNT=$(node -e "
+                const cfg = require('../$(configFile)');
+                const filter = process.env.FILTER;
+                const services = filter
+                  ? cfg.services.filter(s => s.name.includes(filter))
+                  : cfg.services;
+                console.log(services.length);
+              ")
+              echo "Services to process: $SERVICE_COUNT"
+              echo "##vso[task.setvariable variable=serviceCount;isOutput=true]$SERVICE_COUNT"
+            name: countServices
+            displayName: Count target services
+            env:
+              FILTER: ${{ parameters.filter }}
+
+  - stage: GeneratePipelines
+    displayName: Generate Pipeline YAMLs
+    dependsOn: ReadConfiguration
+    jobs:
+      - job: Generate
+        steps:
+          - checkout: self
+
+          - bash: cd generator && npm ci
+            displayName: Install dependencies
+
+          - bash: |
+              cd generator
+              node generate-pipelines.js \
+                --config ../$(configFile) \
+                --output ../generated-pipelines \
+                --environment ${{ parameters.targetEnvironment }} \
+                --filter "${{ parameters.filter }}" \
+                --template templates/service-pipeline.yml.hbs
+            displayName: Generate pipeline YAMLs
+
+          - bash: |
+              echo "=== Generated Pipelines ==="
+              ls -la generated-pipelines/
+              echo ""
+              echo "=== Sample (first file) ==="
+              head -60 generated-pipelines/*.yml | head -60
+            displayName: Review generated files
+
+          - bash: |
+              pip install yamllint
+              for f in generated-pipelines/*.yml; do
+                echo "Linting: $f"
+                yamllint "$f"
+              done
+            displayName: Lint generated YAMLs
+
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: generated-pipelines
+              artifactName: generated-pipelines
+
+  - stage: CommitAndRegister
+    displayName: Commit Pipelines & Register with ADO
+    dependsOn: GeneratePipelines
+    condition: and(succeeded(), eq('${{ parameters.dryRun }}', 'false'))
+    jobs:
+      - job: RegisterPipelines
+        steps:
+          - checkout: self
+            persistCredentials: true
+
+          - task: DownloadPipelineArtifact@2
+            inputs:
+              artifactName: generated-pipelines
+              targetPath: $(Build.SourcesDirectory)/generated-pipelines
+
+          - bash: |
+              git config user.email "ado-bot@mycompany.com"
+              git config user.name "ADO Pipeline Bot"
+
+              # Copy generated pipelines to source tree
+              cp -r generated-pipelines/. .ado/pipelines/generated/
+
+              git add .ado/pipelines/generated/
+              git diff --staged --stat
+
+              if ! git diff --staged --quiet; then
+                git commit -m "chore(pipelines): auto-generated pipeline YAMLs [skip ci]"
+                git push origin HEAD:$(Build.SourceBranchName)
+                echo "Pipelines committed to repository"
+              else
+                echo "No changes to commit"
+              fi
+            displayName: Commit generated pipelines
+
+          - bash: |
+              # Register each generated pipeline via ADO REST API
+              for yaml_file in generated-pipelines/*.yml; do
+                PIPELINE_NAME=$(basename "$yaml_file" .yml)
+                echo "Registering: $PIPELINE_NAME"
+
+                RESPONSE=$(curl -sf -X POST \
+                  -H "Authorization: Basic $(echo -n ":$(adoPat)" | base64)" \
+                  -H "Content-Type: application/json" \
+                  "$(adoOrg)/$(adoProject)/_apis/pipelines?api-version=7.1" \
+                  -d "{
+                    \"name\": \"auto-$PIPELINE_NAME\",
+                    \"folder\": \"\\/generated\",
+                    \"configuration\": {
+                      \"type\": \"yaml\",
+                      \"path\": \"/.ado/pipelines/generated/$PIPELINE_NAME.yml\",
+                      \"repository\": {
+                        \"id\": \"$(repositoryId)\",
+                        \"type\": \"azureReposGit\"
+                      }
+                    }
+                  }" || echo "ALREADY_EXISTS")
+
+                if [ "$RESPONSE" != "ALREADY_EXISTS" ]; then
+                  PIPELINE_ID=$(echo $RESPONSE | jq -r '.id')
+                  echo "Registered pipeline ID: $PIPELINE_ID"
+                else
+                  echo "Pipeline $PIPELINE_NAME already registered, skipping"
+                fi
+              done
+            displayName: Register pipelines via ADO API
+
+  - stage: TriggerBuilds
+    displayName: Trigger Generated Pipelines
+    dependsOn: CommitAndRegister
+    condition: and(succeeded(), eq('${{ parameters.dryRun }}', 'false'))
+    jobs:
+      - job: QueueBuilds
+        steps:
+          - bash: |
+              # Get list of generated pipeline IDs
+              PIPELINES=$(curl -sf \
+                -H "Authorization: Basic $(echo -n ":$(adoPat)" | base64)" \
+                "$(adoOrg)/$(adoProject)/_apis/pipelines?api-version=7.1&folder=%2Fgenerated" \
+                | jq -r '.value[].id')
+
+              for PIPELINE_ID in $PIPELINES; do
+                echo "Queuing build for pipeline $PIPELINE_ID"
+                curl -sf -X POST \
+                  -H "Authorization: Basic $(echo -n ":$(adoPat)" | base64)" \
+                  -H "Content-Type: application/json" \
+                  "$(adoOrg)/$(adoProject)/_apis/pipelines/$PIPELINE_ID/runs?api-version=7.1" \
+                  -d "{
+                    \"resources\": {
+                      \"repositories\": {
+                        \"self\": {
+                          \"refName\": \"refs/heads/$(Build.SourceBranchName)\"
+                        }
+                      }
+                    },
+                    \"variables\": {
+                      \"environment\": {
+                        \"value\": \"${{ parameters.targetEnvironment }}\"
+                      }
+                    }
+                  }" | jq '{id: .id, state: .state, url: .url}'
+              done
+            displayName: Queue pipeline runs
+            env:
+              ADO_PAT: $(adoPat)
+
+  - stage: DryRunReport
+    displayName: Dry Run – Report Only
+    dependsOn: GeneratePipelines
+    condition: and(succeeded('GeneratePipelines'), eq('${{ parameters.dryRun }}', 'true'))
+    jobs:
+      - job: Report
+        steps:
+          - task: DownloadPipelineArtifact@2
+            inputs:
+              artifactName: generated-pipelines
+              targetPath: $(Pipeline.Workspace)/generated-pipelines
+
+          - bash: |
+              echo "=== DRY RUN – Pipelines that would be created ==="
+              for f in $(Pipeline.Workspace)/generated-pipelines/*.yml; do
+                echo ""
+                echo "--- $(basename $f) ---"
+                cat "$f"
+              done
+            displayName: Print generated pipelines (dry run)

@@ -1,0 +1,128 @@
+# ============================================================
+# Pipeline 41: OWASP Dependency Check – SCA (Software Composition Analysis)
+# Complexity: Medium
+# Concepts: OWASP Dependency-Check, Snyk, SBOM generation,
+#           vulnerability thresholds, HTML report artifact
+# ============================================================
+
+trigger:
+  branches:
+    include: [main, develop]
+
+schedules:
+  - cron: '0 3 * * *'      # nightly scan
+    displayName: Nightly dependency scan
+    branches:
+      include: [main]
+    always: true
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  nvdApiKey: $(NVD_API_KEY)         # National Vulnerability Database API key
+  failBuildOnCVSS: 7                # fail on HIGH+ severity
+
+stages:
+
+  - stage: DependencyScan
+    displayName: Dependency & License Scan
+    jobs:
+
+      - job: OWASPCheck
+        displayName: OWASP Dependency-Check
+        timeoutInMinutes: 60
+        steps:
+          - checkout: self
+
+          # Download OWASP Dependency-Check
+          - bash: |
+              VERSION=9.0.10
+              wget -q "https://github.com/jeremylong/DependencyCheck/releases/download/v${VERSION}/dependency-check-${VERSION}-release.zip"
+              unzip -q dependency-check-${VERSION}-release.zip
+              echo "##vso[task.prependpath]$(pwd)/dependency-check/bin"
+            displayName: Install OWASP Dependency-Check
+
+          # Run scan
+          - bash: |
+              dependency-check.sh \
+                --project "$(Build.Repository.Name)" \
+                --scan . \
+                --format HTML \
+                --format JSON \
+                --format JUNIT \
+                --out $(Agent.TempDirectory)/owasp-report \
+                --nvdApiKey $(nvdApiKey) \
+                --failOnCVSS $(failBuildOnCVSS) \
+                --suppression owasp-suppressions.xml \
+                || true     # parse results rather than fail on exit code
+            displayName: Run OWASP scan
+            env:
+              NVD_API_KEY: $(nvdApiKey)
+
+          - task: PublishTestResults@2
+            displayName: Publish OWASP JUnit results
+            condition: always()
+            inputs:
+              testResultsFormat: JUnit
+              testResultsFiles: $(Agent.TempDirectory)/owasp-report/dependency-check-junit.xml
+
+          - task: PublishPipelineArtifact@1
+            condition: always()
+            inputs:
+              targetPath: $(Agent.TempDirectory)/owasp-report
+              artifact: owasp-report
+
+      - job: SnykScan
+        displayName: Snyk SCA & License
+        steps:
+          - checkout: self
+
+          - task: NodeTool@0
+            inputs:
+              versionSpec: '20.x'
+
+          # Install Snyk
+          - script: npm install -g snyk
+            displayName: Install Snyk CLI
+
+          # Authenticate Snyk
+          - script: snyk auth $(SNYK_TOKEN)
+            displayName: Snyk auth
+            env:
+              SNYK_TOKEN: $(SNYK_TOKEN)
+
+          # Snyk test – check for vulnerabilities
+          - script: |
+              snyk test \
+                --severity-threshold=high \
+                --json > $(Agent.TempDirectory)/snyk-results.json \
+                || true
+            displayName: Snyk test
+            continueOnError: true
+            env:
+              SNYK_TOKEN: $(SNYK_TOKEN)
+
+          # Snyk license check
+          - script: |
+              snyk test \
+                --print-deps \
+                --json > $(Agent.TempDirectory)/snyk-licenses.json \
+                || true
+            displayName: Snyk license scan
+            continueOnError: true
+
+          # Generate SBOM (CycloneDX format)
+          - script: |
+              snyk sbom \
+                --format cyclonedx1.4+json \
+                --json-file-output=$(Agent.TempDirectory)/sbom.json \
+                || true
+            displayName: Generate SBOM (CycloneDX)
+            continueOnError: true
+
+          - task: PublishPipelineArtifact@1
+            condition: always()
+            inputs:
+              targetPath: $(Agent.TempDirectory)/snyk-results.json
+              artifact: snyk-report

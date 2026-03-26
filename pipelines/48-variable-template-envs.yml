@@ -1,0 +1,39 @@
+# ============================================================
+# Pipeline 48: Dynamic Variable Template (each + object params)
+# Complexity: Medium
+# Concepts: variable templates, object parameter iteration,
+#           each expression, dynamic step generation,
+#           environment-specific config injection
+# ============================================================
+
+# ── Variable template: templates/vars-environments.yml ───────
+# (inline here as a separate pipeline for demonstration clarity)
+
+trigger:
+  - main
+
+# Load environment configs from a variable template
+variables:
+  - template: templates/vars-environments.yml
+    parameters:
+      environment: production
+
+pool:
+  vmImage: ubuntu-latest
+
+steps:
+  - checkout: self
+
+  - bash: |
+      echo "=== Environment Variables from Template ==="
+      echo "ENVIRONMENT : $(ENVIRONMENT)"
+      echo "APP_URL     : $(APP_URL)"
+      echo "DB_HOST     : $(DB_HOST)"
+      echo "REGION      : $(REGION)"
+      echo "REPLICAS    : $(REPLICAS)"
+    displayName: Print injected env vars
+
+  - bash: |
+      echo "Deploying to: $(ENVIRONMENT)"
+      echo "Endpoint    : $(APP_URL)"
+    displayName: Use env vars in deploy

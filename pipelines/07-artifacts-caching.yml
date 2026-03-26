@@ -1,0 +1,140 @@
+# ============================================================
+# Pipeline 07: Artifacts & Caching
+# Concepts: PublishBuildArtifacts, DownloadBuildArtifacts,
+#           pipeline artifacts (publish/download shorthand),
+#           UniversalPackages, Cache task, artifact filters
+# ============================================================
+
+trigger:
+  branches:
+    include:
+      - main
+
+variables:
+  YARN_CACHE_FOLDER: $(Pipeline.Workspace)/.yarn-cache
+  PIP_CACHE_DIR: $(Pipeline.Workspace)/.pip-cache
+  nodeVersion: '20.x'
+
+stages:
+
+  # ── Stage 1: Build & publish multiple artifact types ─────────
+  - stage: Build
+    jobs:
+      - job: BuildAndPublish
+        displayName: Build, Test & Publish Artifacts
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: self
+
+          # ── Cache: restore npm/yarn cache to speed up installs ──
+          - task: Cache@2
+            displayName: Restore yarn cache
+            inputs:
+              key: 'yarn | "$(Agent.OS)" | yarn.lock'
+              restoreKeys: |
+                yarn | "$(Agent.OS)"
+              path: $(YARN_CACHE_FOLDER)
+
+          - task: NodeTool@0
+            inputs:
+              versionSpec: $(nodeVersion)
+
+          - script: yarn install --frozen-lockfile
+            displayName: Install JS dependencies (cached)
+
+          - script: yarn build
+            displayName: Build JS bundle
+
+          # ── Publish pipeline artifact (modern shorthand task) ──
+          - task: PublishPipelineArtifact@1
+            displayName: Publish JS bundle artifact
+            inputs:
+              targetPath: dist/
+              artifact: js-bundle        # artifact name
+              publishLocation: pipeline  # stored in ADO pipeline storage
+
+          # ── Legacy PublishBuildArtifacts (still widely used) ──
+          - task: PublishBuildArtifacts@1
+            displayName: Publish legacy artifact (drop)
+            inputs:
+              pathToPublish: $(Build.ArtifactStagingDirectory)
+              artifactName: drop
+              publishLocation: Container
+
+          # ── Publish a file artifact (e.g., test report) ─────────
+          - script: mkdir -p $(Build.ArtifactStagingDirectory)/reports && echo "report" > $(Build.ArtifactStagingDirectory)/reports/test-report.html
+            displayName: Generate test report
+
+          - task: PublishPipelineArtifact@1
+            displayName: Publish test report
+            inputs:
+              targetPath: $(Build.ArtifactStagingDirectory)/reports
+              artifact: test-reports
+
+  # ── Stage 2: Download and use artifacts ──────────────────────
+  - stage: UseArtifacts
+    displayName: Consume Artifacts
+    dependsOn: Build
+    jobs:
+      - job: DownloadAndDeploy
+        displayName: Download Artifacts & Deploy
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          # ── Download specific pipeline artifact ─────────────────
+          - task: DownloadPipelineArtifact@2
+            displayName: Download JS bundle
+            inputs:
+              artifact: js-bundle
+              path: $(Pipeline.Workspace)/js-bundle
+
+          # ── Download all artifacts from current pipeline run ────
+          - download: current
+            displayName: Download all artifacts
+
+          # ── Download from a SPECIFIC prior pipeline run ─────────
+          - task: DownloadBuildArtifacts@1
+            displayName: Download legacy drop artifact
+            inputs:
+              buildType: current
+              downloadType: single
+              artifactName: drop
+              downloadPath: $(System.ArtifactsDirectory)
+
+          - script: |
+              echo "Contents of downloaded JS bundle:"
+              ls -la $(Pipeline.Workspace)/js-bundle/
+            displayName: Verify downloaded artifacts
+
+          - script: echo "Deploying from downloaded artifacts..."
+            displayName: Deploy
+
+  # ── Stage 3: Python with pip caching ─────────────────────────
+  - stage: PythonBuild
+    displayName: Python Build (with pip cache)
+    dependsOn: []          # run in parallel with Build stage
+    jobs:
+      - job: PythonJob
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: '3.11'
+
+          # Cache pip downloads
+          - task: Cache@2
+            displayName: Restore pip cache
+            inputs:
+              key: 'pip | "$(Agent.OS)" | requirements.txt'
+              restoreKeys: pip | "$(Agent.OS)"
+              path: $(PIP_CACHE_DIR)
+
+          - script: pip install -r requirements.txt
+            displayName: Install Python deps (cached)
+            env:
+              PIP_CACHE_DIR: $(PIP_CACHE_DIR)
+
+          - script: pytest
+            displayName: Run Python tests

@@ -1,0 +1,140 @@
+# ============================================================
+# Pipeline 55: Multi-Region Deployment
+# Complexity: Complex
+# Concepts: parallel region deployments, traffic manager,
+#           region-specific variable overrides, health gates,
+#           rollback per region
+# ============================================================
+
+trigger:
+  branches:
+    include: [main]
+
+parameters:
+  - name: regions
+    type: object
+    default:
+      - name: eastus
+        displayName: East US
+        webAppName: myapp-eastus
+        trafficWeight: 60
+      - name: westeurope
+        displayName: West Europe
+        webAppName: myapp-westeurope
+        trafficWeight: 30
+      - name: southeastasia
+        displayName: Southeast Asia
+        webAppName: myapp-southeastasia
+        trafficWeight: 10
+
+variables:
+  azureServiceConnection: sc-azure-prod
+  resourceGroup: rg-myapp-global
+  trafficManagerProfile: myapp-tm
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: Build
+    jobs:
+      - job: BuildApp
+        steps:
+          - checkout: self
+          - task: UseDotNet@2
+            inputs: {version: '8.x'}
+          - task: DotNetCoreCLI@2
+            inputs:
+              command: publish
+              publishWebProjects: true
+              arguments: --configuration Release --output $(Build.ArtifactStagingDirectory)
+              zipAfterPublish: true
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: $(Build.ArtifactStagingDirectory)
+              artifact: app-package
+
+  - stage: RemoveFromTrafficManager
+    displayName: Drain Traffic Before Deploy
+    dependsOn: Build
+    jobs:
+      - job: DrainTraffic
+        steps:
+          # Set all endpoints to 0 weight (drain traffic gracefully)
+          - task: AzureCLI@2
+            displayName: Drain Traffic Manager endpoints
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                echo "Draining Traffic Manager endpoints..."
+                az network traffic-manager profile show \
+                  -g $(resourceGroup) -n $(trafficManagerProfile) \
+                  --query endpoints[].name -o tsv \
+                | while read ep; do
+                    az network traffic-manager endpoint update \
+                      -g $(resourceGroup) \
+                      --profile-name $(trafficManagerProfile) \
+                      --name "$ep" --type azureEndpoints \
+                      --weight 0 --endpoint-status Disabled || true
+                  done
+
+  # Deploy to all regions in parallel
+  - stage: DeployAllRegions
+    displayName: Deploy to All Regions (Parallel)
+    dependsOn: RemoveFromTrafficManager
+    jobs:
+      - ${{ each region in parameters.regions }}:
+        - deployment: Deploy_${{ region.name }}
+          displayName: Deploy ${{ region.displayName }}
+          environment: production/${{ region.name }}
+          strategy:
+            runOnce:
+              deploy:
+                steps:
+                  - download: current
+                    artifact: app-package
+
+                  - task: AzureWebApp@1
+                    displayName: Deploy to ${{ region.displayName }}
+                    inputs:
+                      azureSubscription: $(azureServiceConnection)
+                      appType: webApp
+                      appName: ${{ region.webAppName }}
+                      package: $(Pipeline.Workspace)/app-package/**/*.zip
+                      deploymentMethod: zipDeploy
+
+                  - bash: |
+                      URL="https://${{ region.webAppName }}.azurewebsites.net/health"
+                      for i in $(seq 1 10); do
+                        STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL")
+                        [ "$STATUS" = "200" ] && break || sleep 5
+                      done
+                      echo "${{ region.displayName }} health: $STATUS"
+                      [ "$STATUS" = "200" ]
+                    displayName: Health check ${{ region.displayName }}
+
+  - stage: RestoreTrafficManager
+    displayName: Restore Traffic Routing
+    dependsOn: DeployAllRegions
+    condition: succeeded('DeployAllRegions')
+    jobs:
+      - job: RestoreTraffic
+        steps:
+          - task: AzureCLI@2
+            displayName: Restore Traffic Manager weights
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                ${{ each region in parameters.regions }}:
+                az network traffic-manager endpoint update \
+                  -g $(resourceGroup) \
+                  --profile-name $(trafficManagerProfile) \
+                  --name "${{ region.webAppName }}-ep" \
+                  --type azureEndpoints \
+                  --weight ${{ region.trafficWeight }} \
+                  --endpoint-status Enabled || true

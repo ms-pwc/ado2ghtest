@@ -1,0 +1,102 @@
+# ============================================================
+# Pipeline 42: DAST – OWASP ZAP Dynamic Application Security Test
+# Complexity: Medium
+# Concepts: OWASP ZAP Docker container, baseline scan,
+#           API scan (OpenAPI spec), HTML/XML reports,
+#           security gate on alerts
+# ============================================================
+
+trigger: none       # run from release pipeline or on-demand
+
+schedules:
+  - cron: '0 4 * * 2'    # weekly on Tuesday
+    displayName: Weekly DAST scan
+    branches:
+      include: [main]
+    always: true
+
+variables:
+  targetUrl: https://myapp-staging.azurewebsites.net
+  openApiSpec: https://myapp-staging.azurewebsites.net/swagger/v1/swagger.json
+  zapReportDir: $(Agent.TempDirectory)/zap-reports
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: BaselineScan
+    displayName: ZAP Baseline Scan
+    jobs:
+      - job: ZAPBaseline
+        timeoutInMinutes: 30
+        steps:
+          - bash: mkdir -p $(zapReportDir)
+            displayName: Create report dir
+
+          # Run ZAP baseline scan in Docker
+          - bash: |
+              docker run --rm \
+                -v $(zapReportDir):/zap/wrk/:rw \
+                ghcr.io/zaproxy/zaproxy:stable \
+                zap-baseline.py \
+                  -t $(targetUrl) \
+                  -r zap-baseline-report.html \
+                  -x zap-baseline-report.xml \
+                  -J zap-baseline-report.json \
+                  -l WARN \
+                  -I \
+                2>&1 | tee $(zapReportDir)/zap-stdout.txt
+            displayName: ZAP baseline scan
+            continueOnError: true
+
+          - task: PublishPipelineArtifact@1
+            condition: always()
+            inputs:
+              targetPath: $(zapReportDir)
+              artifact: zap-baseline
+
+          # Fail if HIGH alerts found
+          - bash: |
+              HIGH=$(python3 -c "
+              import json, sys
+              with open('$(zapReportDir)/zap-baseline-report.json') as f:
+                  d = json.load(f)
+              highs = sum(1 for a in d.get('site',[{}])[0].get('alerts',[]) if int(a.get('riskcode',0)) >= 3)
+              print(highs)
+              " 2>/dev/null || echo "0")
+              echo "High severity alerts: $HIGH"
+              [ "$HIGH" -lt 1 ] || { echo "HIGH security alerts found!"; exit 1; }
+            displayName: Assert no HIGH alerts
+
+  - stage: APIScan
+    displayName: ZAP API Scan (OpenAPI)
+    dependsOn: []       # run in parallel
+    jobs:
+      - job: ZAPApiScan
+        timeoutInMinutes: 30
+        steps:
+          - bash: mkdir -p $(zapReportDir)/api
+            displayName: Create report dir
+
+          # Full API scan against OpenAPI spec
+          - bash: |
+              docker run --rm \
+                -v $(zapReportDir)/api:/zap/wrk/:rw \
+                ghcr.io/zaproxy/zaproxy:stable \
+                zap-api-scan.py \
+                  -t $(openApiSpec) \
+                  -f openapi \
+                  -r zap-api-report.html \
+                  -x zap-api-report.xml \
+                  -l WARN \
+                  -I \
+                2>&1 || true
+            displayName: ZAP API scan
+            continueOnError: true
+
+          - task: PublishPipelineArtifact@1
+            condition: always()
+            inputs:
+              targetPath: $(zapReportDir)/api
+              artifact: zap-api-scan

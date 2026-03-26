@@ -1,0 +1,69 @@
+# ============================================================
+# Pipeline 20: Workspace & Clean Options
+# Complexity: Simple
+# Concepts: workspace.clean, checkout clean, fetchDepth,
+#           lfs, submodules, persistCredentials, job workspace
+# ============================================================
+
+trigger:
+  - main
+
+pool:
+  vmImage: ubuntu-latest
+
+jobs:
+
+  # Job 1 – Full clean before every run
+  - job: FullClean
+    displayName: Full workspace clean
+    workspace:
+      clean: all               # cleans outputs, resources, and all
+    steps:
+      - checkout: self
+        clean: true            # wipe repo before checkout
+        fetchDepth: 0          # full history (0 = all commits)
+        lfs: false             # do NOT download Git LFS files
+        submodules: false
+      - bash: |
+          echo "Working dir: $(System.DefaultWorkingDirectory)"
+          git log --oneline -5
+        displayName: Show full git history
+
+  # Job 2 – Shallow clone with submodules
+  - job: ShallowWithSubmodules
+    displayName: Shallow clone + submodules
+    workspace:
+      clean: outputs           # only clean build outputs, not sources
+    steps:
+      - checkout: self
+        clean: false
+        fetchDepth: 1          # shallow clone (fastest)
+        submodules: recursive  # initialize and update submodules
+        persistCredentials: true  # keep git credentials for subsequent steps
+      - bash: |
+          echo "Submodule status:"
+          git submodule status || echo "(no submodules present)"
+        displayName: Check submodules
+
+  # Job 3 – LFS enabled
+  - job: WithLFS
+    displayName: Checkout with Git LFS
+    steps:
+      - checkout: self
+        lfs: true              # download Large File Storage files
+        fetchDepth: 1
+      - bash: |
+          echo "LFS objects:"
+          git lfs ls-files || echo "(no LFS files)"
+        displayName: List LFS files
+
+  # Job 4 – Multiple checkouts in one job
+  - job: MultiCheckout
+    displayName: Multiple repo checkouts
+    steps:
+      - checkout: self
+        path: primary
+      - bash: |
+          echo "Primary repo at: $(Pipeline.Workspace)/primary"
+          ls $(Pipeline.Workspace)/primary
+        displayName: Inspect primary repo

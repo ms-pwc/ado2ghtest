@@ -1,0 +1,132 @@
+# ============================================================
+# Pipeline 12: Resources – All Resource Types
+# Concepts: repository resources, container resources,
+#           pipeline resources, package resources,
+#           webhook resources, using downloaded resources,
+#           resource triggers, resource variables
+# ============================================================
+
+trigger:
+  branches:
+    include:
+      - main
+
+# ── All resource types declared here ─────────────────────────
+resources:
+
+  # ── Repository resource ──────────────────────────────────────
+  # Check out code from another repo (even a different ADO project)
+  repositories:
+    - repository: SharedScripts       # local alias used in checkout steps
+      type: git                       # ADO Git repo
+      name: MyProject/shared-scripts  # project/repo
+      ref: refs/heads/main
+
+    - repository: GithubTools
+      type: github
+      name: myorg/build-tools         # GitHub org/repo
+      endpoint: sc-github             # GitHub service connection
+      ref: refs/tags/v2.0.0           # pin to a tag
+
+  # ── Container resource ────────────────────────────────────────
+  containers:
+    - container: buildEnv
+      image: myacr.azurecr.io/build-env:latest
+      endpoint: sc-myacr
+      trigger: true                   # auto-trigger when new image pushed
+
+  # ── Pipeline resource ─────────────────────────────────────────
+  # Consume artifacts from another pipeline
+  pipelines:
+    - pipeline: infraPipeline         # local alias
+      source: InfrastructureCI        # pipeline name in ADO
+      project: MyProject
+      branch: main
+      trigger: true                   # trigger when infra pipeline completes
+
+  # ── Package resource (Universal Packages) ─────────────────────
+  packages:
+    - package: myNpmPackage
+      type: npm
+      connection: sc-npm-feed
+      name: '@myorg/shared-lib'
+      version: 2.1.0
+      trigger: true                   # trigger on new package version
+
+  # ── Webhook resource ──────────────────────────────────────────
+  # Trigger pipeline from an external webhook (e.g., GitHub webhook)
+  webhooks:
+    - webhook: externalHook
+      connection: sc-webhook-github   # incoming webhook service connection
+      filters:
+        - path: action
+          value: released             # only trigger on 'released' events
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  # ── Stage 1: Use repository resources ───────────────────────
+  - stage: UseRepos
+    displayName: Multi-repo checkout
+    jobs:
+      - job: MultiRepoJob
+        displayName: Check out multiple repos
+        steps:
+          # Check out the primary (self) repo
+          - checkout: self
+            path: s/myapp            # put in a named sub-folder
+
+          # Check out the repository resource by its alias
+          - checkout: SharedScripts
+            path: s/shared-scripts
+
+          - checkout: GithubTools
+            path: s/github-tools
+
+          - script: |
+              echo "Contents of workspace:"
+              ls $(Pipeline.Workspace)/s/
+            displayName: List checked-out repos
+
+          # Use a script from the shared-scripts repo
+          - script: bash $(Pipeline.Workspace)/s/shared-scripts/lint.sh
+            displayName: Run shared lint script
+
+  # ── Stage 2: Consume artifacts from another pipeline ────────
+  - stage: UseUpstreamArtifacts
+    displayName: Use upstream pipeline artifacts
+    dependsOn: UseRepos
+    jobs:
+      - job: DownloadUpstreamArtifact
+        steps:
+          # Download artifact produced by the 'infraPipeline' resource
+          - download: infraPipeline       # use the pipeline resource alias
+            artifact: infra-package       # artifact name from that pipeline
+            displayName: Download infra artifact
+
+          - script: |
+              echo "Infra artifact contents:"
+              ls $(Pipeline.Workspace)/infraPipeline/infra-package/
+            displayName: Inspect infraPipeline artifact
+
+          # Resource variables injected automatically:
+          - script: |
+              echo "infraPipeline.runID   = $(resources.pipeline.infraPipeline.runID)"
+              echo "infraPipeline.runName = $(resources.pipeline.infraPipeline.runName)"
+              echo "infraPipeline.sourceBranch = $(resources.pipeline.infraPipeline.sourceBranch)"
+            displayName: Print resource variables
+
+  # ── Stage 3: Webhook-triggered work ──────────────────────────
+  - stage: WebhookWork
+    displayName: Webhook-triggered processing
+    dependsOn: []              # can run independently
+    jobs:
+      - job: HandleWebhook
+        steps:
+          - script: |
+              echo "Webhook payload variables:"
+              echo "  action  : $(resources.webhook.externalHook.action)"
+              echo "  tag_name: $(resources.webhook.externalHook.tag_name)"
+            displayName: Process webhook event

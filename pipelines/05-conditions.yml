@@ -1,0 +1,120 @@
+# ============================================================
+# Pipeline 05: Conditions & Expressions
+# Concepts: condition keyword, built-in condition functions,
+#           runtime expressions $[], compile-time ${{ }},
+#           succeeded/failed/canceled/always, custom conditions,
+#           eq/ne/and/or/in/contains, job-level conditions
+# ============================================================
+
+trigger:
+  branches:
+    include:
+      - main
+      - hotfix/*
+
+variables:
+  deployTarget: azure          # change to 'aws' to test branching
+  runIntegrationTests: true
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  # ── Stage 1: Always builds regardless of branch ──────────────
+  - stage: Build
+    jobs:
+      - job: BuildApp
+        steps:
+          - checkout: self
+          - script: echo "Building application..."
+            displayName: Build
+
+          # Step only runs when branch is main
+          - script: echo "This is the main branch build."
+            displayName: Main-branch-only step
+            condition: eq(variables['Build.SourceBranchName'], 'main')
+
+          # Step only runs when NOT on main
+          - script: echo "Feature branch – skipping certain tasks"
+            displayName: Non-main step
+            condition: ne(variables['Build.SourceBranchName'], 'main')
+
+          # Step runs even if a previous step failed
+          - script: echo "Cleanup – always runs"
+            displayName: Always-run cleanup
+            condition: always()
+
+          # Step runs only if all previous steps succeeded
+          - script: echo "All green so far!"
+            displayName: Success gate
+            condition: succeeded()
+
+          # Step runs only when the job was cancelled
+          - script: echo "Job was cancelled"
+            displayName: Cancellation handler
+            condition: canceled()
+
+  # ── Stage 2: Conditional on stage result + variable value ────
+  - stage: IntegrationTests
+    displayName: Integration Tests
+    dependsOn: Build
+    # Only run when Build succeeded AND the variable flag is true
+    condition: and(succeeded('Build'), eq(variables['runIntegrationTests'], 'true'))
+    jobs:
+      - job: IntTests
+        steps:
+          - script: echo "Running integration tests..."
+            displayName: Integration tests
+
+  # ── Stage 3: Branch that deploys to either Azure or AWS ───────
+  - stage: Deploy
+    displayName: Deploy
+    dependsOn: Build
+    condition: succeeded('Build')
+    jobs:
+
+      # Job runs only when deployTarget == 'azure'
+      - job: DeployAzure
+        displayName: Deploy to Azure
+        condition: eq(variables['deployTarget'], 'azure')
+        steps:
+          - script: echo "Deploying to Azure App Service"
+            displayName: Azure deploy
+
+      # Job runs only when deployTarget == 'aws'
+      - job: DeployAWS
+        displayName: Deploy to AWS
+        condition: eq(variables['deployTarget'], 'aws')
+        steps:
+          - script: echo "Deploying to AWS Elastic Beanstalk"
+            displayName: AWS deploy
+
+      # Job runs for any of the listed targets (in operator)
+      - job: PostDeploy
+        displayName: Post-deploy checks
+        dependsOn:
+          - DeployAzure
+          - DeployAWS
+        condition: |
+          and(
+            in(dependencies.DeployAzure.result, 'Succeeded', 'Skipped'),
+            in(dependencies.DeployAWS.result,   'Succeeded', 'Skipped')
+          )
+        steps:
+          - script: echo "Post-deploy health checks"
+            displayName: Health check
+
+  # ── Stage 4: Runs only on failure of any prior stage ─────────
+  - stage: RollbackOrAlert
+    displayName: Rollback / Alert
+    dependsOn:
+      - Build
+      - IntegrationTests
+      - Deploy
+    condition: failed()        # trigger only when any dependent stage failed
+    jobs:
+      - job: Alert
+        steps:
+          - script: echo "Sending failure alert to on-call team..."
+            displayName: Send alert

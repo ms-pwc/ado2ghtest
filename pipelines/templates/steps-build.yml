@@ -1,0 +1,41 @@
+# ============================================================
+# Step Template: templates/steps-build.yml
+# Concepts: step template, parameters, conditional steps
+# ============================================================
+
+parameters:
+  - name: buildConfig
+    type: string
+    default: Release
+
+  - name: runTests
+    type: boolean
+    default: true
+
+  - name: workingDir
+    type: string
+    default: $(System.DefaultWorkingDirectory)
+
+steps:
+  - script: dotnet restore
+    displayName: Restore NuGet packages
+    workingDirectory: ${{ parameters.workingDir }}
+
+  - script: dotnet build --configuration ${{ parameters.buildConfig }} --no-restore
+    displayName: Build (${{ parameters.buildConfig }})
+    workingDirectory: ${{ parameters.workingDir }}
+
+  # Conditional: only include test step when runTests is true
+  - ${{ if eq(parameters.runTests, true) }}:
+    - script: |
+        dotnet test --no-build --configuration ${{ parameters.buildConfig }} \
+          --logger trx --results-directory $(Agent.TempDirectory)/TestResults
+      displayName: Run unit tests
+      workingDirectory: ${{ parameters.workingDir }}
+
+    - task: PublishTestResults@2
+      displayName: Publish test results
+      condition: succeededOrFailed()
+      inputs:
+        testResultsFormat: VSTest
+        testResultsFiles: '$(Agent.TempDirectory)/TestResults/**/*.trx'

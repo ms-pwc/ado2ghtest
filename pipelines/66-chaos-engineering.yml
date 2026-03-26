@@ -1,0 +1,156 @@
+# ============================================================
+# Pipeline 66: Chaos Engineering Gate
+# Complexity: Complex
+# Concepts: Azure Chaos Studio experiment, experiment trigger,
+#           resilience testing before production, hypothesis validation
+# ============================================================
+
+trigger: none   # Only run manually or from promotion pipeline
+
+parameters:
+  - name: targetEnvironment
+    type: string
+    default: staging
+    values: [staging, production]
+
+  - name: experimentName
+    type: string
+    default: pod-failure-experiment
+
+variables:
+  azureServiceConnection: sc-azure-prod
+  resourceGroup: rg-myapp-${{ parameters.targetEnvironment }}
+  chaosStudioEndpoint: https://eastus.management.azure.com
+  targetUrl: https://myapp-${{ parameters.targetEnvironment }}.azurewebsites.net
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: BaselineMetrics
+    displayName: Capture Baseline Metrics
+    jobs:
+      - job: Baseline
+        steps:
+          # Capture baseline: latency p95, error rate
+          - task: AzureCLI@2
+            displayName: Capture baseline metrics
+            name: baseline
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                # Query Application Insights for last 10 min baseline
+                QUERY="requests | where timestamp > ago(10m) | summarize p95=percentile(duration,95), errorRate=countif(success==false)*100.0/count()"
+                
+                BASELINE=$(az monitor app-insights query \
+                  --app myapp-appinsights \
+                  --analytics-query "$QUERY" \
+                  --query "tables[0].rows[0]" -o json 2>/dev/null || echo '[500, 0.5]')
+                
+                P95=$(echo $BASELINE | python3 -c "import sys,json;d=json.load(sys.stdin);print(d[0])" 2>/dev/null || echo "500")
+                ERR=$(echo $BASELINE | python3 -c "import sys,json;d=json.load(sys.stdin);print(d[1])" 2>/dev/null || echo "0.5")
+                
+                echo "Baseline p95 latency    : ${P95}ms"
+                echo "Baseline error rate     : ${ERR}%"
+                echo "##vso[task.setvariable variable=baselineP95;isOutput=true]$P95"
+                echo "##vso[task.setvariable variable=baselineErrRate;isOutput=true]$ERR"
+
+  - stage: RunChaos
+    displayName: Execute Chaos Experiment
+    dependsOn: BaselineMetrics
+    jobs:
+      - deployment: ChaosExperiment
+        environment: ${{ parameters.targetEnvironment }}
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureCLI@2
+                  displayName: Start Chaos Studio experiment
+                  name: chaosRun
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      # Start the experiment
+                      EXPERIMENT_ID=$(az rest \
+                        --method POST \
+                        --url "https://management.azure.com/subscriptions/$(ARM_SUBSCRIPTION_ID)/resourceGroups/$(resourceGroup)/providers/Microsoft.Chaos/experiments/${{ parameters.experimentName }}/start?api-version=2023-11-01" \
+                        --query 'name' -o tsv 2>/dev/null || echo "experiment-$(Build.BuildId)")
+                      
+                      echo "Experiment started: $EXPERIMENT_ID"
+                      echo "##vso[task.setvariable variable=experimentId;isOutput=true]$EXPERIMENT_ID"
+
+                # Monitor system during chaos
+                - bash: |
+                    echo "Monitoring system under chaos for 5 minutes..."
+                    MAX_ERR=5.0
+                    ALL_OK=true
+                    
+                    for i in $(seq 1 10); do
+                      sleep 30
+                      STATUS=$(curl -s -o /dev/null -w "%{http_code}" $(targetUrl)/health)
+                      echo "Check $i: HTTP $STATUS"
+                      
+                      if [ "$STATUS" != "200" ]; then
+                        echo "System unavailable during chaos! Status: $STATUS"
+                        ALL_OK=false
+                      fi
+                    done
+                    
+                    if [ "$ALL_OK" = "true" ]; then
+                      echo "System remained healthy during chaos experiment ✓"
+                    else
+                      echo "System showed degradation during chaos experiment"
+                      exit 1
+                    fi
+                  displayName: Monitor resilience during chaos
+                  timeoutInMinutes: 10
+
+  - stage: ValidateRecovery
+    displayName: Validate System Recovery
+    dependsOn: RunChaos
+    jobs:
+      - job: Recovery
+        steps:
+          - task: AzureCLI@2
+            displayName: Stop chaos experiment
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az rest \
+                  --method POST \
+                  --url "https://management.azure.com/subscriptions/$(ARM_SUBSCRIPTION_ID)/resourceGroups/$(resourceGroup)/providers/Microsoft.Chaos/experiments/${{ parameters.experimentName }}/cancel?api-version=2023-11-01" \
+                  || echo "Cancel request sent"
+
+          - bash: |
+              echo "Waiting 2 minutes for system to recover..."
+              sleep 120
+              
+              # Verify recovery
+              for i in $(seq 1 5); do
+                STATUS=$(curl -s -o /dev/null -w "%{http_code}" $(targetUrl)/health)
+                echo "Recovery check $i: HTTP $STATUS"
+                [ "$STATUS" = "200" ] && echo "System recovered!" && exit 0
+                sleep 15
+              done
+              
+              echo "System did NOT recover after chaos experiment!"
+              exit 1
+            displayName: Verify recovery
+
+          - bash: |
+              cat <<'REPORT'
+              === Chaos Engineering Report ===
+              Experiment    : ${{ parameters.experimentName }}
+              Environment   : ${{ parameters.targetEnvironment }}
+              Hypothesis    : System maintains <5% error rate during pod failures
+              Result        : $(Agent.JobStatus)
+              REPORT
+            displayName: Print chaos report

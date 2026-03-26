@@ -1,0 +1,81 @@
+# ============================================================
+# Pipeline 29: Fan-Out / Fan-In Job Pattern
+# Complexity: Medium
+# Concepts: parallel independent jobs (fan-out),
+#           aggregator job with multiple dependsOn (fan-in),
+#           job result checks, parallel efficiency
+# ============================================================
+
+trigger:
+  - main
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+  - stage: ParallelChecks
+    displayName: Fan-Out Parallel Checks
+    jobs:
+
+      # ── Fan-Out: 4 independent jobs run in parallel ───────────
+      - job: UnitTests
+        displayName: Unit Tests
+        steps:
+          - checkout: self
+          - script: echo "Running unit tests..." ; sleep 3
+            displayName: Unit tests
+
+      - job: IntegrationTests
+        displayName: Integration Tests
+        steps:
+          - checkout: self
+          - script: echo "Running integration tests..." ; sleep 5
+            displayName: Integration tests
+
+      - job: Linting
+        displayName: Code Linting
+        steps:
+          - checkout: self
+          - script: echo "Running linter..." ; sleep 2
+            displayName: Lint
+
+      - job: SecurityScan
+        displayName: Security Scan
+        steps:
+          - checkout: self
+          - script: echo "Running SAST scan..." ; sleep 4
+            displayName: SAST scan
+
+      # ── Fan-In: aggregator waits for ALL parallel jobs ────────
+      - job: AggregateResults
+        displayName: Aggregate Results (Fan-In)
+        dependsOn:
+          - UnitTests
+          - IntegrationTests
+          - Linting
+          - SecurityScan
+        # Only proceed when ALL fan-out jobs succeeded
+        condition: |
+          and(
+            eq(dependencies.UnitTests.result,        'Succeeded'),
+            eq(dependencies.IntegrationTests.result, 'Succeeded'),
+            eq(dependencies.Linting.result,          'Succeeded'),
+            eq(dependencies.SecurityScan.result,     'Succeeded')
+          )
+        steps:
+          - script: |
+              echo "All parallel checks passed!"
+              echo "UnitTests        : $(dependencies.UnitTests.result)"
+              echo "IntegrationTests : $(dependencies.IntegrationTests.result)"
+              echo "Linting          : $(dependencies.Linting.result)"
+              echo "SecurityScan     : $(dependencies.SecurityScan.result)"
+            displayName: Report aggregate results
+
+  - stage: Build
+    displayName: Build (after all checks pass)
+    dependsOn: ParallelChecks
+    jobs:
+      - job: BuildArtifact
+        steps:
+          - script: echo "Building after all quality gates passed"
+            displayName: Build

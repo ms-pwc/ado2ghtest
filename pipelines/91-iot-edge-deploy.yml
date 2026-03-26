@@ -1,0 +1,217 @@
+# ============================================================
+# Pipeline 91: IoT Edge Module Deployment
+# Complexity: Highly Complex
+# Concepts: Azure IoT Hub, IoT Edge deployment manifests,
+#           Docker module builds, edge registry push, OTA update,
+#           device twin desired properties, deployment rollout,
+#           connection string security, layered deployments
+# ============================================================
+
+trigger:
+  branches:
+    include: [main]
+  paths:
+    include: [modules/**, deployment-manifests/**]
+
+parameters:
+  - name: environment
+    type: string
+    default: prod
+    values: [dev, staging, prod]
+  - name: targetDeviceGroups
+    type: object
+    default:
+      - groupName: factory-floor-a
+        tagKey: location
+        tagValue: factory_a
+        priority: 10
+      - groupName: factory-floor-b
+        tagKey: location
+        tagValue: factory_b
+        priority: 10
+  - name: modules
+    type: object
+    default:
+      - name: temperature-sensor
+        dockerfile: modules/temperature-sensor/Dockerfile
+        platforms: [amd64, arm64v8]
+      - name: data-aggregator
+        dockerfile: modules/data-aggregator/Dockerfile
+        platforms: [amd64]
+      - name: edge-gateway
+        dockerfile: modules/edge-gateway/Dockerfile
+        platforms: [amd64, arm64v8]
+
+variables:
+  - group: iot-${{ parameters.environment }}-vars
+  - name: imageTag
+    value: $(Build.BuildId)
+  - name: iotHubName
+    value: iothub-$(orgName)-${{ parameters.environment }}
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: BuildModules
+    displayName: Build IoT Edge Modules
+    jobs:
+      - job: BuildAndPush
+        steps:
+          - checkout: self
+
+          - bash: |
+              docker buildx create --use
+              docker buildx inspect --bootstrap
+            displayName: Setup Docker buildx
+
+          - ${{ each module in parameters.modules }}:
+            - bash: |
+                PLATFORMS=$(echo '${{ join(",", module.platforms) }}' | sed 's/ /,/g')
+                PLATFORMS="linux/$(echo '${{ join(",linux/", module.platforms) }}')"
+
+                echo "Building ${{ module.name }} for platforms: $PLATFORMS"
+
+                docker buildx build \
+                  --platform "$PLATFORMS" \
+                  --file "${{ module.dockerfile }}" \
+                  --tag "$(acrName).azurecr.io/iotedge/${{ module.name }}:$(imageTag)" \
+                  --tag "$(acrName).azurecr.io/iotedge/${{ module.name }}:latest" \
+                  --push \
+                  --provenance false \
+                  $(dirname ${{ module.dockerfile }})
+              displayName: Build ${{ module.name }}
+
+          - bash: |
+              # Quick scan of built images
+              for module in ${{ each module in parameters.modules }}; do
+                docker pull "$(acrName).azurecr.io/iotedge/${{ module.name }}:$(imageTag)" 2>/dev/null || true
+              done
+            displayName: Pull images for scan (optional)
+
+  - stage: GenerateManifest
+    displayName: Generate Deployment Manifest
+    dependsOn: BuildModules
+    jobs:
+      - job: GenerateManifest
+        steps:
+          - checkout: self
+
+          - bash: npm install -g @iothub/iothub-explorer || pip install iotedgedev
+            displayName: Install IoT tools
+
+          - bash: |
+              # Template the deployment manifest with current image tags
+              python3 - <<'PYEOF'
+              import json, os, re
+
+              with open("deployment-manifests/deployment.template.json") as f:
+                  template = f.read()
+
+              # Replace image tag placeholders
+              template = template.replace("${IMAGE_TAG}", os.environ["IMAGE_TAG"])
+              template = template.replace("${ACR_NAME}", os.environ["ACR_NAME"])
+              template = template.replace("${ENVIRONMENT}", os.environ["ENVIRONMENT"])
+
+              manifest = json.loads(template)
+              print(json.dumps(manifest, indent=2))
+
+              with open("deployment.json", "w") as f:
+                  json.dump(manifest, f, indent=2)
+
+              print("Manifest generated successfully")
+              PYEOF
+            displayName: Template deployment manifest
+            env:
+              IMAGE_TAG: $(imageTag)
+              ACR_NAME: $(acrName)
+              ENVIRONMENT: ${{ parameters.environment }}
+
+          - bash: |
+              # Validate manifest schema
+              python3 - <<'PYEOF'
+              import json, sys
+
+              with open("deployment.json") as f:
+                  manifest = json.load(f)
+
+              required = ["modulesContent"]
+              for field in required:
+                  if field not in manifest:
+                      print(f"ERROR: Missing required field: {field}", file=sys.stderr)
+                      sys.exit(1)
+
+              system_modules = manifest["modulesContent"]["$edgeAgent"]["properties.desired"]["systemModules"]
+              if "edgeHub" not in system_modules or "edgeAgent" not in system_modules:
+                  print("ERROR: System modules missing edgeHub or edgeAgent", file=sys.stderr)
+                  sys.exit(1)
+
+              print("Manifest validation passed")
+              PYEOF
+            displayName: Validate manifest schema
+
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: deployment.json
+              artifactName: edge-deployment-manifest
+
+  - stage: DeployToEdge
+    displayName: Deploy to IoT Edge Devices
+    dependsOn: GenerateManifest
+    jobs:
+      - ${{ each group in parameters.targetDeviceGroups }}:
+        - deployment: Deploy_${{ replace(group.groupName, '-', '_') }}
+          displayName: Deploy to ${{ group.groupName }}
+          environment: ${{ parameters.environment }}-iot-edge
+          strategy:
+            runOnce:
+              deploy:
+                steps:
+                  - task: DownloadPipelineArtifact@2
+                    inputs:
+                      artifactName: edge-deployment-manifest
+                      targetPath: $(Pipeline.Workspace)/manifest
+
+                  - task: AzureCLI@2
+                    displayName: Apply layered deployment – ${{ group.groupName }}
+                    inputs:
+                      azureSubscription: sc-azure-${{ parameters.environment }}
+                      scriptType: bash
+                      scriptLocation: inlineScript
+                      inlineScript: |
+                        az iot edge deployment create \
+                          --hub-name $(iotHubName) \
+                          --deployment-id "deployment-$(imageTag)-${{ group.groupName }}" \
+                          --content "$(Pipeline.Workspace)/manifest/deployment.json" \
+                          --target-condition "tags.${{ group.tagKey }}='${{ group.tagValue }}'" \
+                          --priority ${{ group.priority }} \
+                          --labels "{\"version\":\"$(imageTag)\", \"env\":\"${{ parameters.environment }}\"}"
+
+                        echo "Deployment created for ${{ group.groupName }}"
+
+                  - task: AzureCLI@2
+                    displayName: Wait and verify deployment
+                    inputs:
+                      azureSubscription: sc-azure-${{ parameters.environment }}
+                      scriptType: bash
+                      scriptLocation: inlineScript
+                      inlineScript: |
+                        # Poll deployment status
+                        for i in $(seq 1 20); do
+                          STATUS=$(az iot edge deployment show \
+                            --hub-name $(iotHubName) \
+                            --deployment-id "deployment-$(imageTag)-${{ group.groupName }}" \
+                            --query "systemMetrics.results.{reportedSuccess:reportedSuccessfulCount,applied:appliedCount}" \
+                            -o json)
+                          echo "Status: $STATUS"
+                          APPLIED=$(echo "$STATUS" | jq -r '.applied // 0')
+                          [ "$APPLIED" -gt "0" ] && break
+                          sleep 30
+                        done
+
+                        # Show deployment summary
+                        az iot edge deployment list \
+                          --hub-name $(iotHubName) \
+                          --query "[?contains(deploymentId,'${{ group.groupName }}')].{id:deploymentId,applied:systemMetrics.results.appliedCount,success:systemMetrics.results.reportedSuccessfulCount}" \
+                          -o table

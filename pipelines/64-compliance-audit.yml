@@ -1,0 +1,189 @@
+# ============================================================
+# Pipeline 64: Compliance & Audit Pipeline
+# Complexity: Complex
+# Concepts: CIS benchmark checks, policy compliance via Azure Policy,
+#           license compliance, audit report generation, SBOM
+# ============================================================
+
+trigger: none
+
+schedules:
+  - cron: '0 6 * * 1'    # Monday morning compliance run
+    displayName: Weekly compliance audit
+    branches:
+      include: [main]
+    always: true
+
+variables:
+  azureServiceConnection: sc-azure-prod
+  subscriptionId: $(ARM_SUBSCRIPTION_ID)
+  resourceGroup: rg-myapp-prod
+  reportOutputDir: $(Agent.TempDirectory)/compliance-reports
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: CloudComplianceCheck
+    displayName: Azure Policy & CIS Compliance
+    jobs:
+      - job: PolicyCompliance
+        timeoutInMinutes: 30
+        steps:
+          - bash: mkdir -p $(reportOutputDir)
+            displayName: Setup report dir
+
+          - task: AzureCLI@2
+            displayName: Check Azure Policy compliance
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                echo "=== Azure Policy Compliance Summary ===" | tee $(reportOutputDir)/policy-report.txt
+                
+                az policy state summarize \
+                  --resource-group $(resourceGroup) \
+                  --query '{
+                    total: results.policyassignments | length(@),
+                    compliant: results.policyassignments[?complianceState=='"'"'Compliant'"'"'] | length(@),
+                    nonCompliant: results.policyassignments[?complianceState=='"'"'NonCompliant'"'"'] | length(@)
+                  }' \
+                  -o json | tee -a $(reportOutputDir)/policy-report.txt
+                
+                # List non-compliant resources
+                echo ""
+                echo "=== Non-Compliant Resources ===" | tee -a $(reportOutputDir)/policy-report.txt
+                az policy state list \
+                  --resource-group $(resourceGroup) \
+                  --filter "complianceState eq 'NonCompliant'" \
+                  --query "[].{Resource:resourceId,Policy:policyAssignmentName}" \
+                  -o table | tee -a $(reportOutputDir)/policy-report.txt
+
+          - task: PublishPipelineArtifact@1
+            condition: always()
+            inputs:
+              targetPath: $(reportOutputDir)/policy-report.txt
+              artifact: policy-compliance
+
+  - stage: LicenseCompliance
+    displayName: License Compliance Check
+    dependsOn: []
+    jobs:
+      - job: LicenseCheck
+        steps:
+          - checkout: self
+
+          - task: NodeTool@0
+            inputs:
+              versionSpec: '20.x'
+
+          # Check NPM licenses
+          - script: |
+              npm install -g license-checker
+              license-checker \
+                --onlyAllow 'MIT;Apache-2.0;BSD-2-Clause;BSD-3-Clause;ISC;CC0-1.0' \
+                --json \
+                --out $(reportOutputDir)/npm-licenses.json \
+                || true
+            displayName: NPM license check
+            continueOnError: true
+
+          # Check NuGet licenses
+          - task: UseDotNet@2
+            inputs:
+              version: '8.x'
+
+          - script: |
+              dotnet tool install --global dotnet-project-licenses 2>/dev/null || true
+              dotnet-project-licenses \
+                --projects src/ \
+                --unique \
+                --output $(reportOutputDir)/nuget-licenses.txt \
+                2>/dev/null || echo "NuGet license check completed"
+            displayName: NuGet license check
+            continueOnError: true
+
+          - task: PublishPipelineArtifact@1
+            condition: always()
+            inputs:
+              targetPath: $(reportOutputDir)
+              artifact: license-compliance
+
+  - stage: SBOMGeneration
+    displayName: Generate SBOM
+    dependsOn: []
+    jobs:
+      - job: GenerateSBOM
+        steps:
+          - checkout: self
+
+          - bash: |
+              curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+                | sh -s -- -b /usr/local/bin
+            displayName: Install Syft
+
+          - bash: |
+              mkdir -p $(reportOutputDir)
+              
+              # Generate SBOM in multiple formats
+              syft dir:. -o spdx-json \
+                --file $(reportOutputDir)/sbom.spdx.json
+              
+              syft dir:. -o cyclonedx-json \
+                --file $(reportOutputDir)/sbom.cyclonedx.json
+              
+              syft dir:. -o table
+            displayName: Generate SBOM (multi-format)
+
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: $(reportOutputDir)
+              artifact: sbom
+
+  - stage: GenerateComplianceReport
+    displayName: Consolidated Compliance Report
+    dependsOn:
+      - CloudComplianceCheck
+      - LicenseCompliance
+      - SBOMGeneration
+    condition: always()
+    jobs:
+      - job: ConsolidateReport
+        steps:
+          - download: current
+
+          - bash: |
+              mkdir -p $(reportOutputDir)
+              
+              cat > $(reportOutputDir)/compliance-summary.md <<EOF
+              # Compliance Audit Report
+              
+              **Date**: $(date -u +%Y-%m-%d)
+              **Build**: $(Build.BuildNumber)
+              **Repository**: $(Build.Repository.Name)
+              **Branch**: $(Build.SourceBranchName)
+              
+              ## Summary
+              
+              | Check | Status |
+              |-------|--------|
+              | Azure Policy | ${{ stageDependencies.CloudComplianceCheck.PolicyCompliance.result }} |
+              | License Compliance | ${{ stageDependencies.LicenseCompliance.LicenseCheck.result }} |
+              | SBOM Generated | ${{ stageDependencies.SBOMGeneration.GenerateSBOM.result }} |
+              
+              ## Artifacts
+              - Policy Compliance Report
+              - License Inventory (NPM + NuGet)
+              - SBOM (SPDX + CycloneDX)
+              
+              EOF
+              
+              cat $(reportOutputDir)/compliance-summary.md
+            displayName: Generate summary report
+
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: $(reportOutputDir)/compliance-summary.md
+              artifact: compliance-summary

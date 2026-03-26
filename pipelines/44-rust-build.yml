@@ -1,0 +1,123 @@
+# ============================================================
+# Pipeline 44: Rust – Build, Test & Cross-Compile
+# Complexity: Medium
+# Concepts: Rust toolchain install, cargo, cross-compilation,
+#           clippy, fmt check, cargo test, artifact assembly
+# ============================================================
+
+trigger:
+  branches:
+    include: [main]
+  paths:
+    include: ['**/*.rs', Cargo.toml, Cargo.lock]
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  rustVersion: stable
+  binaryName: myapp
+
+stages:
+
+  - stage: Check
+    jobs:
+      - job: RustCheck
+        steps:
+          - checkout: self
+
+          # Install Rust via rustup
+          - bash: |
+              curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain $(rustVersion)
+              echo "##vso[task.prependpath]$HOME/.cargo/bin"
+              rustup --version
+              rustc --version
+              cargo --version
+            displayName: Install Rust $(rustVersion)
+
+          # Cache cargo registry and build artifacts
+          - task: Cache@2
+            displayName: Cache cargo registry
+            inputs:
+              key: 'cargo | "$(Agent.OS)" | Cargo.lock'
+              restoreKeys: cargo | "$(Agent.OS)"
+              path: $(HOME)/.cargo/registry
+
+          - bash: |
+              cargo fmt --all -- --check
+            displayName: cargo fmt check
+
+          - bash: |
+              cargo clippy --all-targets --all-features -- -D warnings
+            displayName: cargo clippy
+
+  - stage: Test
+    dependsOn: Check
+    jobs:
+      - job: CargoTest
+        steps:
+          - checkout: self
+          - bash: |
+              curl https://sh.rustup.rs -sSf | sh -s -- -y
+              echo "##vso[task.prependpath]$HOME/.cargo/bin"
+            displayName: Install Rust
+
+          - task: Cache@2
+            inputs:
+              key: 'cargo | "$(Agent.OS)" | Cargo.lock'
+              path: $(HOME)/.cargo/registry
+
+          - bash: cargo test --all-features -- --test-threads=4
+            displayName: cargo test
+
+          # Install cargo-tarpaulin for coverage
+          - bash: |
+              cargo install cargo-tarpaulin
+              cargo tarpaulin --out Xml --output-dir $(Agent.TempDirectory)
+            displayName: Coverage (tarpaulin)
+            continueOnError: true
+
+  - stage: CrossCompile
+    displayName: Cross-Compile
+    dependsOn: Test
+    jobs:
+      - job: Build
+        strategy:
+          matrix:
+            linux_x86_64:
+              target: x86_64-unknown-linux-gnu
+              suffix: linux-x86_64
+            linux_arm64:
+              target: aarch64-unknown-linux-gnu
+              suffix: linux-arm64
+            windows:
+              target: x86_64-pc-windows-gnu
+              suffix: windows-x86_64.exe
+          maxParallel: 3
+        steps:
+          - checkout: self
+
+          - bash: |
+              curl https://sh.rustup.rs -sSf | sh -s -- -y
+              echo "##vso[task.prependpath]$HOME/.cargo/bin"
+              rustup target add $(target)
+              # For cross-compilation toolchains
+              cargo install cross --git https://github.com/cross-rs/cross 2>/dev/null || true
+            displayName: Setup Rust + target
+
+          - bash: |
+              mkdir -p dist
+              cross build \
+                --release \
+                --target $(target) \
+                2>/dev/null \
+                || cargo build --release --target $(target)
+              
+              cp target/$(target)/release/$(binaryName)* dist/$(binaryName)-$(suffix) 2>/dev/null || true
+              ls -lh dist/
+            displayName: cargo build --release
+
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: dist
+              artifact: rust-binary-$(suffix)

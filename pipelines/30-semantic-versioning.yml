@@ -1,0 +1,122 @@
+# ============================================================
+# Pipeline 30: Semantic Versioning with GitVersion
+# Complexity: Medium
+# Concepts: GitVersion task, SemVer, branch-based versioning,
+#           AssemblyInfo patching, version output variables,
+#           tagging the repo post-build
+# ============================================================
+
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+      - release/*
+      - hotfix/*
+      - feature/*
+  tags:
+    include:
+      - v*
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  buildConfiguration: Release
+
+stages:
+
+  - stage: Version
+    displayName: Compute Version
+    jobs:
+      - job: GitVersionJob
+        displayName: Run GitVersion
+        steps:
+          - checkout: self
+            fetchDepth: 0            # GitVersion needs full history
+
+          # Install and run GitVersion
+          - task: gitversion/setup@1
+            displayName: Install GitVersion
+            inputs:
+              versionSpec: '5.x'
+
+          - task: gitversion/execute@1
+            displayName: Determine version
+            name: gitversion           # output variable prefix
+            inputs:
+              useConfigFile: true
+              configFilePath: GitVersion.yml
+
+          # Print all GitVersion outputs
+          - bash: |
+              echo "SemVer         : $(gitversion.SemVer)"
+              echo "FullSemVer     : $(gitversion.FullSemVer)"
+              echo "NuGetVersion   : $(gitversion.NuGetVersion)"
+              echo "MajorMinorPatch: $(gitversion.MajorMinorPatch)"
+              echo "PreReleaseTag  : $(gitversion.PreReleaseTag)"
+              echo "BranchName     : $(gitversion.BranchName)"
+              echo "Sha            : $(gitversion.Sha)"
+            displayName: Print version info
+
+          # Update the ADO build number to match SemVer
+          - bash: |
+              echo "##vso[build.updatebuildnumber]$(gitversion.FullSemVer)+$(Build.BuildId)"
+            displayName: Update build number
+
+  - stage: Build
+    displayName: Build (v$(gitversion.SemVer))
+    dependsOn: Version
+    variables:
+      # Consume GitVersion output from previous stage
+      semVer: $[ stageDependencies.Version.GitVersionJob.outputs['gitversion.SemVer'] ]
+      nugetVer: $[ stageDependencies.Version.GitVersionJob.outputs['gitversion.NuGetVersion'] ]
+    jobs:
+      - job: BuildJob
+        steps:
+          - checkout: self
+            fetchDepth: 0
+
+          - task: gitversion/setup@1
+            inputs:
+              versionSpec: '5.x'
+
+          - task: gitversion/execute@1
+            name: gv
+            inputs:
+              useConfigFile: true
+              configFilePath: GitVersion.yml
+
+          - task: UseDotNet@2
+            inputs:
+              version: '8.x'
+
+          - task: DotNetCoreCLI@2
+            displayName: dotnet build with version
+            inputs:
+              command: build
+              arguments: >
+                --configuration $(buildConfiguration)
+                /p:Version=$(gv.SemVer)
+                /p:AssemblyVersion=$(gv.MajorMinorPatch)
+                /p:FileVersion=$(gv.MajorMinorPatch)
+
+          - task: DotNetCoreCLI@2
+            displayName: dotnet pack
+            inputs:
+              command: pack
+              packagesToPack: 'src/**/*.csproj'
+              nobuild: true
+              versioningScheme: byEnvVar
+              versionEnvVar: BUILD_VERSION
+            env:
+              BUILD_VERSION: $(gv.NuGetVersion)
+
+          # Tag the Git commit with the computed version (main only)
+          - bash: |
+              git config user.email "pipeline@devops.local"
+              git config user.name  "Azure Pipelines"
+              git tag "v$(gv.SemVer)" -m "Release v$(gv.SemVer) [skip ci]"
+              git push origin "v$(gv.SemVer)"
+            displayName: Tag release commit
+            condition: eq(variables['Build.SourceBranchName'], 'main')

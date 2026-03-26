@@ -1,0 +1,146 @@
+# ============================================================
+# Pipeline 61: iOS – Xcode Build, Test & Sign
+# Complexity: Complex
+# Concepts: Xcode task, Apple signing certificate (Secure Files),
+#           provisioning profiles, TestFlight upload, IPA artifact
+# ============================================================
+
+trigger:
+  branches:
+    include: [main, release/*]
+  paths:
+    include: [ios/**]
+
+pool:
+  vmImage: macOS-latest
+
+variables:
+  xcodeVersion: '15'
+  scheme: MyApp
+  configuration: Release
+  sdk: iphoneos
+  p12Filename: ios-distribution.p12
+  provProfileFilename: MyApp_Distribution.mobileprovision
+  appIdentifier: com.mycompany.myapp
+  teamId: $(APPLE_TEAM_ID)
+
+stages:
+
+  - stage: Build
+    jobs:
+      - job: XcodeBuild
+        timeoutInMinutes: 60
+        steps:
+          - checkout: self
+
+          # Select Xcode version
+          - task: XcodeCheck@0
+            displayName: Check Xcode $(xcodeVersion)
+            continueOnError: true
+
+          - bash: |
+              sudo xcode-select -s /Applications/Xcode_$(xcodeVersion).app/Contents/Developer
+              xcodebuild -version
+            displayName: Select Xcode version
+
+          # Cache CocoaPods
+          - task: Cache@2
+            displayName: Cache CocoaPods
+            inputs:
+              key: 'pods | "$(Agent.OS)" | ios/Podfile.lock'
+              restoreKeys: pods | "$(Agent.OS)"
+              path: ios/Pods
+
+          - bash: |
+              cd ios
+              pod install --repo-update
+            displayName: pod install
+
+          # Download signing certificate from Secure Files
+          - task: DownloadSecureFile@1
+            displayName: Download P12 certificate
+            name: signingCert
+            inputs:
+              secureFile: $(p12Filename)
+
+          - task: DownloadSecureFile@1
+            displayName: Download provisioning profile
+            name: provProfile
+            inputs:
+              secureFile: $(provProfileFilename)
+
+          # Install certificate and provisioning profile
+          - task: InstallAppleCertificate@2
+            displayName: Install Apple certificate
+            inputs:
+              certSecureFile: $(p12Filename)
+              certPwd: $(P12_PASSWORD)
+
+          - task: InstallAppleProvisioningProfile@1
+            displayName: Install provisioning profile
+            inputs:
+              provisioningProfileLocation: secureFiles
+              provProfileSecureFile: $(provProfileFilename)
+
+          # Run unit tests
+          - task: Xcode@5
+            displayName: Xcode unit tests
+            inputs:
+              actions: test
+              scheme: $(scheme)
+              sdk: iphonesimulator
+              platform: iOS Simulator
+              configuration: Debug
+              xcWorkspacePath: ios/$(scheme).xcworkspace
+              signingOption: nosign
+              publishJUnitResults: true
+              args: -destination "platform=iOS Simulator,name=iPhone 15,OS=17.0"
+
+          # Build for distribution
+          - task: Xcode@5
+            displayName: Xcode build (Release)
+            inputs:
+              actions: archive
+              scheme: $(scheme)
+              sdk: $(sdk)
+              configuration: $(configuration)
+              xcWorkspacePath: ios/$(scheme).xcworkspace
+              packageApp: true
+              archivePath: $(Build.ArtifactStagingDirectory)/$(scheme).xcarchive
+              exportPath: $(Build.ArtifactStagingDirectory)/ipa
+              signingOption: manual
+              signingIdentity: $(APPLE_CERTIFICATE_SIGNING_IDENTITY)
+              provisioningProfileUuid: $(APPLE_PROV_PROFILE_UUID)
+              teamId: $(teamId)
+              args: >
+                DEVELOPMENT_TEAM=$(teamId)
+
+          - task: PublishPipelineArtifact@1
+            displayName: Publish IPA
+            inputs:
+              targetPath: $(Build.ArtifactStagingDirectory)/ipa
+              artifact: ios-ipa
+
+  - stage: Distribute
+    displayName: Upload to TestFlight
+    dependsOn: Build
+    jobs:
+      - deployment: TestFlight
+        environment: ios-testflight
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: ios-ipa
+
+                # Upload via altool / notarytool
+                - bash: |
+                    xcrun altool \
+                      --upload-app \
+                      -f "$(Pipeline.Workspace)/ios-ipa/*.ipa" \
+                      -t ios \
+                      -u "$(APPLE_ID)" \
+                      -p "$(APP_SPECIFIC_PASSWORD)" \
+                      --output-format xml
+                  displayName: Upload to TestFlight

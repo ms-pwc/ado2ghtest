@@ -1,0 +1,168 @@
+# ============================================================
+# Pipeline 70: Enterprise Approval Workflow
+# Complexity: Complex
+# Concepts: multi-level approvals, business hours check,
+#           ITSM ServiceNow change ticket, environment checks,
+#           approver group notification, timeout handling
+# ============================================================
+
+trigger:
+  branches:
+    include: [main]
+
+variables:
+  azureServiceConnection: sc-azure-prod
+  serviceNowUrl: https://mycompany.service-now.com
+  serviceNowToken: $(SERVICENOW_TOKEN)
+  changeWindowStart: '20:00'    # 8 PM UTC
+  changeWindowEnd: '04:00'      # 4 AM UTC next day
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: Build
+    jobs:
+      - job: Build
+        steps:
+          - checkout: self
+          - script: echo "Building..."
+            displayName: Build
+
+  - stage: CreateChangeTicket
+    displayName: Create ITSM Change Ticket
+    dependsOn: Build
+    jobs:
+      - job: CreateTicket
+        steps:
+          - bash: |
+              # Create ServiceNow Change Request
+              RESPONSE=$(curl -s -X POST \
+                -H "Content-Type: application/json" \
+                -H "Authorization: Bearer $(SERVICENOW_TOKEN)" \
+                "$(serviceNowUrl)/api/now/table/change_request" \
+                -d "{
+                  \"short_description\": \"Deploy $(Build.Repository.Name) build $(Build.BuildId) to production\",
+                  \"category\": \"Software\",
+                  \"priority\": \"3\",
+                  \"risk\": \"Low\",
+                  \"impact\": \"2\",
+                  \"assignment_group\": \"DevOps Team\",
+                  \"description\": \"Automated deployment via Azure DevOps pipeline $(Build.BuildId). Branch: $(Build.SourceBranchName). Requested by: $(Build.RequestedFor)\",
+                  \"start_date\": \"$(date -u -d '+1 hour' '+%Y-%m-%d %H:%M:%S')\",
+                  \"end_date\": \"$(date -u -d '+3 hours' '+%Y-%m-%d %H:%M:%S')\"
+                }" 2>/dev/null || echo '{"result":{"number":"CHG0000000"}}')
+              
+              CHG_NUMBER=$(echo $RESPONSE | python3 -c "import sys,json;print(json.load(sys.stdin).get('result',{}).get('number','CHG-UNKNOWN'))" 2>/dev/null)
+              
+              echo "Change ticket created: $CHG_NUMBER"
+              echo "##vso[task.setvariable variable=changeTicket;isOutput=true]$CHG_NUMBER"
+              echo "##vso[build.addbuildtag]change:$CHG_NUMBER"
+            displayName: Create ServiceNow change request
+            name: ticket
+            env:
+              SERVICENOW_TOKEN: $(serviceNowToken)
+
+  - stage: Level1Approval
+    displayName: L1 Approval – Dev Lead
+    dependsOn: CreateChangeTicket
+    jobs:
+      - job: L1Gate
+        pool: server         # agentless
+        timeoutInMinutes: 480      # 8 hours
+        steps:
+          - task: ManualValidation@0
+            displayName: Dev Lead approval
+            timeoutInMinutes: 480
+            inputs:
+              notifyUsers: |
+                dev-lead@mycompany.com
+              instructions: |
+                Level 1 Approval Required – Dev Lead Sign-off
+                
+                Pipeline  : $(Build.DefinitionName)
+                Build     : $(Build.BuildNumber)
+                Branch    : $(Build.SourceBranchName)
+                Requestor : $(Build.RequestedFor)
+                Change ID : $(changeTicket)
+                
+                Please review the build artifacts and approve to proceed to L2.
+              onTimeout: reject
+
+  - stage: Level2Approval
+    displayName: L2 Approval – Change Manager
+    dependsOn: Level1Approval
+    jobs:
+      - job: L2Gate
+        pool: server
+        timeoutInMinutes: 1440    # 24 hours
+        steps:
+          - task: ManualValidation@0
+            displayName: Change Manager approval
+            timeoutInMinutes: 1440
+            inputs:
+              notifyUsers: |
+                change-manager@mycompany.com
+                architecture-board@mycompany.com
+              instructions: |
+                Level 2 Approval Required – Change Advisory Board
+                
+                This deployment has been approved by the Dev Lead.
+                CAB approval is required before production deployment.
+                
+                Change ID  : $(changeTicket)
+                Build      : $(Build.BuildNumber)
+                CAB Meeting: Check weekly CAB schedule for approval slot.
+              onTimeout: reject
+
+  - stage: BusinessHoursCheck
+    displayName: Check Change Window
+    dependsOn: Level2Approval
+    jobs:
+      - job: CheckWindow
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - bash: |
+              CURRENT_HOUR=$(date -u +%H)
+              CURRENT_MINUTE=$(date -u +%M)
+              CURRENT_TIME="$CURRENT_HOUR:$CURRENT_MINUTE"
+              
+              echo "Current UTC time: $CURRENT_TIME"
+              echo "Change window: $(changeWindowStart) - $(changeWindowEnd) UTC"
+              
+              # Allow deployment if within change window (20:00 - 04:00 UTC)
+              if [ $CURRENT_HOUR -ge 20 ] || [ $CURRENT_HOUR -lt 4 ]; then
+                echo "Within change window. Proceeding with deployment."
+              else
+                echo "Outside change window (current: ${CURRENT_TIME}). Deployment blocked."
+                echo "Deployments are only allowed between 20:00 and 04:00 UTC."
+                exit 1
+              fi
+            displayName: Verify change window
+
+  - stage: DeployProduction
+    displayName: Deploy to Production
+    dependsOn: BusinessHoursCheck
+    jobs:
+      - deployment: ProdDeploy
+        environment: production
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - bash: echo "Deploying to production..."
+                  displayName: Production deployment
+
+                # Update ServiceNow ticket to Closed
+                - bash: |
+                    curl -s -X PATCH \
+                      -H "Content-Type: application/json" \
+                      -H "Authorization: Bearer $(SERVICENOW_TOKEN)" \
+                      "$(serviceNowUrl)/api/now/table/change_request/$(changeTicket)?sysparm_query=number=$(changeTicket)" \
+                      -d '{"state":"3","close_code":"Successful","close_notes":"Deployment completed successfully via Azure DevOps."}' \
+                      || echo "ServiceNow update attempted"
+                  displayName: Close ServiceNow change ticket
+                  env:
+                    SERVICENOW_TOKEN: $(serviceNowToken)

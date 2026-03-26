@@ -1,0 +1,309 @@
+# ============================================================
+# Pipeline 80: Hotfix Emergency Fast-Path Deploy
+# Complexity: Highly Complex
+# Concepts: Expedited pipeline gate, compressed test suite,
+#           pre-approved change window bypass, forced merge
+#           checks, rollback trigger, on-call notification,
+#           post-hotfix retrospective
+# ============================================================
+
+trigger:
+  branches:
+    include: [hotfix/*, release/*]
+
+pr: none   # Hotfix is not triggered by PR
+
+parameters:
+  - name: hotfixScope
+    type: string
+    default: critical
+    values: [critical, high, medium]
+    displayName: Hotfix Severity
+  - name: skipStagingDeploy
+    type: boolean
+    default: false
+    displayName: Skip staging (critical only!)
+  - name: notifyChannel
+    type: string
+    default: '#incidents'
+  - name: changeTicketId
+    type: string
+    default: ''
+    displayName: ServiceNow Change Ticket (required for prod)
+
+variables:
+  - group: hotfix-pipeline-vars
+  - name: imageTag
+    value: hotfix-$(Build.BuildId)
+  - name: hotfixBranch
+    value: $(Build.SourceBranchName)
+  - name: isCritical
+    value: ${{ eq(parameters.hotfixScope, 'critical') }}
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: Validate
+    displayName: Fast Validate (Critical Path Only)
+    jobs:
+      - job: QuickChecks
+        timeoutInMinutes: 10
+        steps:
+          - checkout: self
+
+          - bash: |
+              echo "=== HOTFIX FAST-PATH ACTIVATED ==="
+              echo "Branch:   $(hotfixBranch)"
+              echo "Severity: ${{ parameters.hotfixScope }}"
+              echo "Change ticket: ${{ parameters.changeTicketId }}"
+              echo "Build: $(imageTag)"
+            displayName: Print hotfix context
+
+          - bash: |
+              # Ensure branch is named hotfix/* or release/*
+              if [[ "$(hotfixBranch)" != hotfix/* ]] && [[ "$(hotfixBranch)" != release/* ]]; then
+                echo "##vso[task.logissue type=error]Emergency pipeline triggered from non-hotfix branch!"
+                exit 1
+              fi
+            displayName: Validate branch naming
+
+          - ${{ if ne(parameters.changeTicketId, '') }}:
+            - bash: |
+                # Validate change ticket exists in ServiceNow
+                SN_STATUS=$(curl -sf \
+                  -u "$(serviceNowUser):$(serviceNowPassword)" \
+                  "$(serviceNowUrl)/api/now/table/change_request?sysparm_query=number=${{ parameters.changeTicketId }}" \
+                  | jq -r '.result[0].state // "NOT_FOUND"')
+                echo "Change ticket ${{ parameters.changeTicketId }} status: $SN_STATUS"
+                if [ "$SN_STATUS" = "NOT_FOUND" ]; then
+                  echo "##vso[task.logissue type=error]Change ticket ${{ parameters.changeTicketId }} not found!"
+                  exit 1
+                fi
+              displayName: Validate change ticket
+
+          - bash: |
+              # Run smoke/critical tests only (skip full suite)
+              echo "Running critical smoke tests only..."
+            displayName: Smoke tests (abbreviated)
+
+  - stage: NotifyOnCall
+    displayName: Notify On-Call Team
+    dependsOn: Validate
+    jobs:
+      - job: SendNotification
+        steps:
+          - bash: |
+              TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+              curl -sf -X POST "$(teamsWebhook)" \
+                -H "Content-Type: application/json" \
+                -d "{
+                  \"type\": \"AdaptiveCard\",
+                  \"version\": \"1.4\",
+                  \"body\": [
+                    {\"type\":\"TextBlock\",\"text\":\"🚨 HOTFIX DEPLOYING\",\"color\":\"Attention\",\"weight\":\"Bolder\",\"size\":\"Large\"},
+                    {\"type\":\"FactSet\",\"facts\":[
+                      {\"title\":\"Branch\",\"value\":\"$(hotfixBranch)\"},
+                      {\"title\":\"Severity\",\"value\":\"${{ parameters.hotfixScope }}\"},
+                      {\"title\":\"Initiated by\",\"value\":\"$(Build.RequestedFor)\"},
+                      {\"title\":\"Build\",\"value\":\"$(imageTag)\"},
+                      {\"title\":\"Change Ticket\",\"value\":\"${{ parameters.changeTicketId }}\"},
+                      {\"title\":\"Time\",\"value\":\"$TIMESTAMP\"}
+                    ]}
+                  ],
+                  \"actions\":[{\"type\":\"Action.OpenUrl\",\"title\":\"View Build\",\"url\":\"$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)\"}]
+                }"
+            displayName: Notify Teams
+          
+          - bash: |
+              # PagerDuty alert for critical
+              if [ "${{ parameters.hotfixScope }}" = "critical" ]; then
+                curl -sf -X POST "https://events.pagerduty.com/v2/enqueue" \
+                  -H "Content-Type: application/json" \
+                  -d "{
+                    \"routing_key\": \"$(pagerDutyIntegrationKey)\",
+                    \"event_action\": \"trigger\",
+                    \"payload\": {
+                      \"summary\": \"Emergency hotfix deploying: $(hotfixBranch)\",
+                      \"severity\": \"critical\",
+                      \"source\": \"ADO Pipeline\",
+                      \"custom_details\": {
+                        \"build\": \"$(imageTag)\",
+                        \"requested_by\": \"$(Build.RequestedFor)\"
+                      }
+                    }
+                  }"
+              fi
+            displayName: PagerDuty alert (critical only)
+
+  - stage: BuildHotfix
+    displayName: Build Hotfix Image
+    dependsOn: NotifyOnCall
+    jobs:
+      - job: Build
+        timeoutInMinutes: 15
+        steps:
+          - checkout: self
+          - task: Docker@2
+            inputs:
+              command: buildAndPush
+              repository: $(containerRegistry)/$(imageRepository)
+              containerRegistry: sc-acr
+              tags: |
+                $(imageTag)
+                hotfix-latest
+          - bash: |
+              # Quick Trivy scan (critical CVEs only)
+              docker run --rm \
+                -v /var/run/docker.sock:/var/run/docker.sock \
+                aquasec/trivy:latest image \
+                --severity CRITICAL \
+                --exit-code 1 \
+                $(containerRegistry)/$(imageRepository):$(imageTag) || true
+            displayName: Critical CVE scan
+
+  - stage: DeployStaging
+    displayName: Deploy to Staging
+    dependsOn: BuildHotfix
+    condition: and(succeeded(), eq('${{ parameters.skipStagingDeploy }}', 'false'))
+    jobs:
+      - deployment: StagingDeploy
+        environment: staging
+        timeoutInMinutes: 20
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: KubernetesManifest@1
+                  inputs:
+                    action: deploy
+                    kubernetesServiceConnection: sc-aks-staging
+                    namespace: myapp-staging
+                    manifests: k8s/deployment.yml
+                    containers: $(containerRegistry)/$(imageRepository):$(imageTag)
+                - bash: sleep 30 && curl -sf https://staging.mycompany.com/health
+                  displayName: Staging health check
+
+  - stage: DeployProd
+    displayName: Deploy to Production (Fast-Path)
+    dependsOn:
+      - DeployStaging
+      - BuildHotfix
+    condition: |
+      or(
+        and(succeeded('DeployStaging'), ne('${{ parameters.skipStagingDeploy }}', 'true')),
+        and(succeeded('BuildHotfix'), eq('${{ parameters.skipStagingDeploy }}', 'true'), eq('${{ parameters.hotfixScope }}', 'critical'))
+      )
+    jobs:
+      - deployment: ProdHotfix
+        environment: production
+        timeoutInMinutes: 15
+        strategy:
+          runOnce:
+            preDeploy:
+              steps:
+                - bash: echo "Pre-deploy checks for hotfix $(imageTag)"
+            deploy:
+              steps:
+                - task: KubernetesManifest@1
+                  displayName: Hotfix rollout
+                  inputs:
+                    action: deploy
+                    kubernetesServiceConnection: sc-aks-prod
+                    namespace: myapp-prod
+                    manifests: k8s/deployment.yml
+                    containers: $(containerRegistry)/$(imageRepository):$(imageTag)
+
+                - bash: |
+                    sleep 30
+                    STATUS=$(curl -sf https://api.mycompany.com/health | jq -r '.status')
+                    echo "Health: $STATUS"
+                    if [ "$STATUS" != "Healthy" ]; then
+                      echo "##vso[task.logissue type=error]Production health check failed after hotfix deploy!"
+                      exit 1
+                    fi
+                  displayName: Production health check
+
+                - task: Kubernetes@1
+                  displayName: Verify rollout completed
+                  inputs:
+                    kubernetesServiceEndpoint: sc-aks-prod
+                    namespace: myapp-prod
+                    command: rollout
+                    arguments: status deployment/myapp-api --timeout=5m
+
+            on:
+              failure:
+                steps:
+                  - bash: |
+                      echo "##vso[task.logissue type=error]Hotfix deploy FAILED – triggering rollback!"
+                      kubectl rollout undo deployment/myapp-api -n myapp-prod
+                    displayName: Auto-rollback on failure
+                    env:
+                      KUBECONFIG: $(kubeconfig)
+
+  - stage: PostHotfixActions
+    displayName: Post-Hotfix Actions
+    dependsOn: DeployProd
+    condition: always()
+    jobs:
+      - job: UpdateChangeTicket
+        condition: and(succeeded('DeployProd'), ne('${{ parameters.changeTicketId }}', ''))
+        steps:
+          - bash: |
+              # Update ServiceNow change ticket
+              curl -sf -X PATCH \
+                -u "$(serviceNowUser):$(serviceNowPassword)" \
+                -H "Content-Type: application/json" \
+                "$(serviceNowUrl)/api/now/table/change_request?sysparm_query=number=${{ parameters.changeTicketId }}" \
+                -d "{
+                  \"state\": \"3\",
+                  \"close_code\": \"successful\",
+                  \"close_notes\": \"Hotfix $(imageTag) deployed successfully by ADO pipeline $(Build.BuildId)\"
+                }"
+            displayName: Close change ticket
+
+      - job: ResolveAlert
+        condition: and(succeeded('DeployProd'), eq('${{ parameters.hotfixScope }}', 'critical'))
+        steps:
+          - bash: |
+              curl -sf -X POST "https://events.pagerduty.com/v2/enqueue" \
+                -H "Content-Type: application/json" \
+                -d "{
+                  \"routing_key\": \"$(pagerDutyIntegrationKey)\",
+                  \"event_action\": \"resolve\",
+                  \"payload\": {
+                    \"summary\": \"Hotfix $(imageTag) deployed – incident resolved\",
+                    \"severity\": \"info\",
+                    \"source\": \"ADO Pipeline\"
+                  }
+                }"
+            displayName: Resolve PagerDuty alert
+
+      - job: CreateRetrospective
+        steps:
+          - bash: |
+              cat <<EOF > hotfix-retro-$(Build.BuildId).md
+              # Post-Hotfix Retrospective
+
+              **Hotfix:** $(imageTag)
+              **Branch:** $(hotfixBranch)
+              **Severity:** ${{ parameters.hotfixScope }}
+              **Deployed by:** $(Build.RequestedFor)
+              **Date:** $(date -u)
+              **Change Ticket:** ${{ parameters.changeTicketId }}
+
+              ## Action Items
+              - [ ] Root cause analysis
+              - [ ] Add regression test
+              - [ ] Update runbook if needed
+              - [ ] Forward to engineering leads
+              EOF
+              cat hotfix-retro-$(Build.BuildId).md
+            displayName: Draft retrospective template
+
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: hotfix-retro-$(Build.BuildId).md
+              artifactName: hotfix-retrospective

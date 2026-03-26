@@ -1,0 +1,93 @@
+# ============================================================
+# Pipeline 47: Self-Hosted Agent Pool
+# Complexity: Medium
+# Concepts: demands, capabilities, self-hosted pool definition,
+#           pool YAML syntax, parallel jobs on self-hosted,
+#           agent-specific tools and on-prem resources
+# ============================================================
+
+trigger:
+  branches:
+    include: [main]
+
+# Override pool per stage / job to mix hosted and self-hosted
+stages:
+
+  # ── Stage on Microsoft-hosted (public internet tasks) ────────
+  - stage: PublicBuild
+    displayName: Build (Microsoft Hosted)
+    jobs:
+      - job: Build
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: self
+          - script: echo "Building on Microsoft-hosted agent"
+            displayName: Build
+
+  # ── Stage on self-hosted pool ────────────────────────────────
+  - stage: OnPremDeploy
+    displayName: Deploy (Self-Hosted)
+    dependsOn: PublicBuild
+    jobs:
+
+      # Use a named self-hosted pool
+      - job: DeployToOnPrem
+        displayName: Deploy to on-premises servers
+        pool:
+          name: OnPrem-Production     # self-hosted agent pool name in ADO
+          demands:
+            - Agent.OS -equals Windows_NT          # Windows agent only
+            - vstest                               # agent must have vstest installed
+            - CustomCapability -equals MyApp       # custom agent capability
+        timeoutInMinutes: 30
+        steps:
+          - checkout: self
+          - script: echo "Running on self-hosted Windows agent"
+            displayName: Deploy on-prem
+
+          - task: PowerShell@2
+            displayName: Deploy using on-prem scripts
+            inputs:
+              targetType: filePath
+              filePath: scripts/deploy-onprem.ps1
+              arguments: -Environment production -BuildId $(Build.BuildId)
+
+      # Another job requiring Linux self-hosted with Docker
+      - job: DockerOnPrem
+        displayName: Docker ops on self-hosted Linux
+        pool:
+          name: OnPrem-Linux
+          demands:
+            - docker               # agent must advertise docker capability
+            - Agent.OS -equals Linux
+        steps:
+          - checkout: self
+          - script: |
+              docker --version
+              docker ps
+            displayName: Docker availability check
+
+          - task: Docker@2
+            displayName: Build internal image
+            inputs:
+              command: build
+              dockerfile: Dockerfile
+              repository: internal-registry.mycompany.com/myapp
+              tags: $(Build.BuildId)
+
+  # ── Stage mixing both pools ───────────────────────────────────
+  - stage: Validation
+    displayName: Post-Deploy Validation
+    dependsOn: OnPremDeploy
+    jobs:
+      # Smoke tests from hosted agent (external access)
+      - job: ExternalSmoke
+        displayName: External smoke tests
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - bash: |
+              curl -f https://myapp.internal.company.com/health \
+                || echo "Health check failed"
+            displayName: Smoke test

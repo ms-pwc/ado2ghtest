@@ -1,0 +1,46 @@
+# ============================================================
+# Pipeline 15: macOS Agent – Xcode & Homebrew
+# Complexity: Simple
+# Concepts: macOS vmImage, Xcode task, Homebrew, bash on macOS
+# ============================================================
+
+trigger:
+  - main
+
+pool:
+  vmImage: macOS-latest
+
+steps:
+  - checkout: self
+
+  - bash: |
+      echo "=== macOS Environment ==="
+      sw_vers
+      echo "Xcode: $(xcode-select -p)"
+      xcodebuild -version
+      echo "Homebrew: $(brew --version)"
+    displayName: Print macOS env info
+
+  # Install a tool via Homebrew
+  - bash: brew install jq
+    displayName: Install jq via Homebrew
+
+  - bash: |
+      echo '{"name":"pipeline","version":"1.0"}' | jq .
+    displayName: Run jq
+
+  # Select Xcode version
+  - task: XcodeCheck@0
+    displayName: Check Xcode availability
+    continueOnError: true
+
+  # List available simulators
+  - bash: xcrun simctl list devicetypes --json | jq '[.devicetypes[].name] | .[0:5]'
+    displayName: List first 5 simulator device types
+    continueOnError: true
+
+  - bash: |
+      echo "PROCESSOR: $(uname -m)"
+      echo "HOSTNAME : $(hostname)"
+      echo "SHELL    : $SHELL"
+    displayName: Print agent info

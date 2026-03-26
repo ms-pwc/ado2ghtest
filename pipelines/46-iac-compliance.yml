@@ -1,0 +1,125 @@
+# ============================================================
+# Pipeline 46: Infrastructure Compliance – Checkov & tfsec
+# Complexity: Medium
+# Concepts: Checkov IaC scan, tfsec, Terrascan, output formats,
+#           soft-fail thresholds, SARIF upload
+# ============================================================
+
+trigger:
+  branches:
+    include: [main, develop]
+  paths:
+    include: [terraform/**, infra/**, k8s/**]
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: IaCCompliance
+    displayName: IaC Compliance Scanning
+    jobs:
+
+      - job: Checkov
+        displayName: Checkov – Terraform/ARM/K8s
+        steps:
+          - checkout: self
+
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: '3.11'
+
+          - script: pip install checkov
+            displayName: Install Checkov
+
+          # Scan Terraform
+          - script: |
+              checkov -d terraform/ \
+                --framework terraform \
+                --output cli \
+                --output junitxml \
+                --output-file-path $(Agent.TempDirectory)/checkov \
+                --soft-fail \
+                --check CKV_AZURE_1,CKV_AZURE_2 \
+                || true
+            displayName: Checkov Terraform scan
+            continueOnError: true
+
+          # Scan Kubernetes manifests
+          - script: |
+              checkov -d k8s/ \
+                --framework kubernetes \
+                --output cli \
+                --output junitxml \
+                --output-file-path $(Agent.TempDirectory)/checkov-k8s \
+                --soft-fail \
+                || true
+            displayName: Checkov Kubernetes scan
+            continueOnError: true
+
+          # SARIF output (uploads to GitHub Advanced Security / ADO)
+          - script: |
+              checkov -d terraform/ \
+                --output sarif \
+                --output-file-path $(Agent.TempDirectory)/checkov-sarif \
+                --soft-fail \
+                || true
+            displayName: Checkov SARIF output
+            continueOnError: true
+
+          - task: PublishTestResults@2
+            condition: always()
+            inputs:
+              testResultsFormat: JUnit
+              testResultsFiles: $(Agent.TempDirectory)/checkov/*results_junitxml.xml
+
+          - task: PublishPipelineArtifact@1
+            condition: always()
+            inputs:
+              targetPath: $(Agent.TempDirectory)/checkov
+              artifact: checkov-results
+
+      - job: Tfsec
+        displayName: tfsec – Terraform Security
+        steps:
+          - checkout: self
+
+          # Install tfsec
+          - bash: |
+              curl -s https://raw.githubusercontent.com/aquasecurity/tfsec/master/scripts/install_linux.sh | bash
+              tfsec --version
+            displayName: Install tfsec
+
+          - bash: |
+              tfsec terraform/ \
+                --format junit \
+                --out $(Agent.TempDirectory)/tfsec-results.xml \
+                --minimum-severity HIGH \
+                --soft-fail \
+                || true
+            displayName: tfsec scan
+
+          - task: PublishTestResults@2
+            condition: always()
+            inputs:
+              testResultsFormat: JUnit
+              testResultsFiles: $(Agent.TempDirectory)/tfsec-results.xml
+
+      - job: KubeScore
+        displayName: kube-score – K8s Best Practices
+        steps:
+          - checkout: self
+
+          - bash: |
+              curl -L https://github.com/zegl/kube-score/releases/download/v1.18.0/kube-score_1.18.0_linux_amd64.tar.gz \
+                | tar xz
+              sudo mv kube-score /usr/local/bin/
+              kube-score version
+            displayName: Install kube-score
+
+          - bash: |
+              find k8s/ -name "*.yml" -o -name "*.yaml" \
+                | xargs kube-score score \
+                  --output-format ci \
+                  || true
+            displayName: kube-score scan

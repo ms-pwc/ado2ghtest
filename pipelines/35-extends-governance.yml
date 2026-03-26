@@ -1,0 +1,29 @@
+# ============================================================
+# Pipeline 35: Extends Template – Security & Governance
+# Complexity: Medium
+# Concepts: extends keyword, template restrictions, required
+#           templates, parameter validation, governance pattern
+# ============================================================
+
+# This pipeline MUST extend the corporate base template.
+# The base template enforces: security scan, audit logging,
+# approved pools only. Teams cannot bypass these controls.
+extends:
+  template: templates/base-governance.yml
+  parameters:
+    # Must declare the target environment
+    targetEnvironment: production
+    # Team must supply their build steps
+    buildSteps:
+      - task: UseDotNet@2
+        inputs:
+          version: '8.x'
+      - script: dotnet build --configuration Release
+        displayName: Build
+      - script: dotnet test --no-build
+        displayName: Test
+
+    # Optional extra post-deploy steps
+    postDeploySteps:
+      - script: echo "Custom post-deploy validation"
+        displayName: Custom validation

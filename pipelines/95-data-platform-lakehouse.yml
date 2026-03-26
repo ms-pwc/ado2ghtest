@@ -1,0 +1,254 @@
+# ============================================================
+# Pipeline 95: Data Platform – Lakehouse Deploy
+# Complexity: Highly Complex
+# Concepts: Azure Data Lake Gen2, Azure Synapse pipelines deploy,
+#           Delta Lake schema migration, Unity Catalog setup,
+#           Databricks notebooks & jobs, Great Expectations
+#           data quality checks, lineage metadata, Access Control
+# ============================================================
+
+trigger:
+  branches:
+    include: [main]
+  paths:
+    include: [data/**, notebooks/**, synapse/**, catalogs/**]
+
+parameters:
+  - name: environment
+    type: string
+    default: staging
+    values: [dev, staging, prod]
+  - name: deployComponents
+    type: object
+    default:
+      synapse: true
+      databricks: true
+      dataQuality: true
+      catalog: true
+  - name: schemaMigration
+    type: boolean
+    default: false
+
+variables:
+  - group: data-platform-${{ parameters.environment }}-vars
+  - name: synapseWorkspace
+    value: synapse-$(orgName)-${{ parameters.environment }}
+  - name: databricksUrl
+    value: https://$(databricksRegion).azuredatabricks.net
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: ValidateDataAssets
+    displayName: Validate Data Assets
+    jobs:
+      - job: ValidateSQLAndSchemas
+        steps:
+          - checkout: self
+          - bash: pip install sqlfluff great_expectations
+            displayName: Install validation tools
+          - bash: |
+              # Lint SQL files
+              sqlfluff lint data/sql/ \
+                --dialect sparksql \
+                --rules L001,L002,L003,L010,L019,L022,L036 || true
+            displayName: Lint SQL files
+          - bash: |
+              # Validate Great Expectations suites
+              python3 - <<'PYEOF'
+              import great_expectations as ge
+              import glob, json, sys
+
+              for suite_file in glob.glob("data/expectations/*.json"):
+                  with open(suite_file) as f:
+                      suite = json.load(f)
+                  print(f"Validating: {suite_file}")
+                  # Check each expectation has required fields
+                  for exp in suite.get("expectations", []):
+                      if "expectation_type" not in exp:
+                          print(f"ERROR: Missing expectation_type in {suite_file}")
+                          sys.exit(1)
+              print("All expectation suites valid")
+              PYEOF
+            displayName: Validate GE suites
+
+  - stage: DeploySynapse
+    displayName: Deploy Synapse Analytics Pipelines
+    dependsOn: ValidateDataAssets
+    condition: and(succeeded(), eq('${{ parameters.deployComponents.synapse }}', 'true'))
+    jobs:
+      - deployment: SynapseDeploy
+        environment: ${{ parameters.environment }}-synapse
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - bash: |
+                    pip install azure-synapse azure-mgmt-synapse azure-identity
+                  displayName: Install Synapse SDK
+
+                # Deploy linked services first
+                - task: AzureCLI@2
+                  displayName: Deploy Synapse linked services
+                  inputs:
+                    azureSubscription: sc-azure-${{ parameters.environment }}
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      for ls_file in synapse/linkedServices/*.json; do
+                        LS_NAME=$(jq -r '.name' "$ls_file")
+                        echo "Deploying linked service: $LS_NAME"
+                        az synapse linked-service create \
+                          --workspace-name $(synapseWorkspace) \
+                          --name "$LS_NAME" \
+                          --file "@$ls_file" 2>/dev/null || \
+                        az synapse linked-service set \
+                          --workspace-name $(synapseWorkspace) \
+                          --name "$LS_NAME" \
+                          --file "@$ls_file"
+                      done
+
+                # Deploy datasets
+                - task: AzureCLI@2
+                  displayName: Deploy datasets
+                  inputs:
+                    azureSubscription: sc-azure-${{ parameters.environment }}
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      for ds_file in synapse/datasets/*.json; do
+                        DS_NAME=$(jq -r '.name' "$ds_file")
+                        az synapse dataset create \
+                          --workspace-name $(synapseWorkspace) \
+                          --name "$DS_NAME" \
+                          --file "@$ds_file" 2>/dev/null || \
+                        az synapse dataset set \
+                          --workspace-name $(synapseWorkspace) \
+                          --name "$DS_NAME" \
+                          --file "@$ds_file"
+                      done
+
+                # Deploy pipelines
+                - task: AzureCLI@2
+                  displayName: Deploy Synapse pipelines
+                  inputs:
+                    azureSubscription: sc-azure-${{ parameters.environment }}
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      for pipeline_file in synapse/pipelines/*.json; do
+                        PIPELINE_NAME=$(jq -r '.name' "$pipeline_file")
+                        echo "Deploying pipeline: $PIPELINE_NAME"
+                        az synapse pipeline create \
+                          --workspace-name $(synapseWorkspace) \
+                          --name "$PIPELINE_NAME" \
+                          --file "@$pipeline_file" 2>/dev/null || \
+                        az synapse pipeline set \
+                          --workspace-name $(synapseWorkspace) \
+                          --name "$PIPELINE_NAME" \
+                          --file "@$pipeline_file"
+                      done
+
+  - stage: DeployDatabricks
+    displayName: Deploy Databricks Notebooks & Jobs
+    dependsOn: ValidateDataAssets
+    condition: and(succeeded(), eq('${{ parameters.deployComponents.databricks }}', 'true'))
+    jobs:
+      - deployment: DatabricksJobs
+        environment: ${{ parameters.environment }}-databricks
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - bash: |
+                    pip install databricks-cli databricks-sdk
+                    databricks --version
+                  displayName: Install Databricks CLI
+
+                - bash: |
+                    # Configure Databricks CLI
+                    cat > ~/.databrickscfg <<EOF
+                    [DEFAULT]
+                    host = $(databricksUrl)
+                    token = $(databricksToken)
+                    EOF
+                  displayName: Configure Databricks CLI
+
+                # Upload notebooks to workspace
+                - bash: |
+                    for nb_file in notebooks/$(parameters.environment)/**/*.py notebooks/**/*.ipynb; do
+                      [ -f "$nb_file" ] || continue
+                      NB_PATH="/Shared/data-platform/$(dirname $nb_file | sed 's|notebooks/||')/$(basename $nb_file)"
+                      echo "Uploading: $nb_file → $NB_PATH"
+                      databricks workspace import "$nb_file" "$NB_PATH" --overwrite
+                    done
+                  displayName: Upload notebooks
+
+                # Create/update Databricks jobs
+                - bash: |
+                    for job_file in data/databricks-jobs/*.json; do
+                      JOB_NAME=$(jq -r '.name' "$job_file")
+                      echo "Deploying job: $JOB_NAME"
+
+                      EXISTING_JOB_ID=$(databricks jobs list --output json \
+                        | jq -r ".jobs[] | select(.settings.name==\"$JOB_NAME\") | .job_id" || echo "")
+
+                      if [ -n "$EXISTING_JOB_ID" ]; then
+                        databricks jobs reset --job-id "$EXISTING_JOB_ID" --json "@$job_file"
+                        echo "Updated job $JOB_NAME (ID: $EXISTING_JOB_ID)"
+                      else
+                        NEW_JOB=$(databricks jobs create --json "@$job_file")
+                        echo "Created job $JOB_NAME: $NEW_JOB"
+                      fi
+                    done
+                  displayName: Deploy Databricks jobs
+
+  - stage: SchemaMigration
+    displayName: Delta Lake Schema Migration
+    dependsOn:
+      - DeploySynapse
+      - DeployDatabricks
+    condition: and(succeeded(), eq('${{ parameters.schemaMigration }}', 'true'))
+    jobs:
+      - deployment: MigrateSchema
+        environment: ${{ parameters.environment }}-databricks
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - bash: pip install databricks-sdk
+                - bash: |
+                    # Run schema migration notebook
+                    databricks jobs run-now \
+                      --job-id $(schemaMigrationJobId) \
+                      --notebook-params "{\"environment\":\"${{ parameters.environment }}\",\"dryRun\":\"false\"}" \
+                      --wait
+                  displayName: Run schema migration
+                  env:
+                    DATABRICKS_HOST: $(databricksUrl)
+                    DATABRICKS_TOKEN: $(databricksToken)
+
+  - stage: DataQualityChecks
+    displayName: Data Quality Validation
+    dependsOn: SchemaMigration
+    condition: and(succeeded(), eq('${{ parameters.deployComponents.dataQuality }}', true))
+    jobs:
+      - job: GEValidation
+        steps:
+          - checkout: self
+          - bash: pip install great_expectations databricks-sdk
+          - bash: |
+              # Run Great Expectations checkpoints
+              ge run-checkpoint \
+                --checkpoint-name post_deploy_${{ parameters.environment }} || true
+            displayName: Run Great Expectations checkpoint
+          - task: PublishPipelineArtifact@1
+            condition: always()
+            inputs:
+              targetPath: data/expectations/validations
+              artifactName: data-quality-results

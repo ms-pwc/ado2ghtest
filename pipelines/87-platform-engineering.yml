@@ -1,0 +1,254 @@
+# ============================================================
+# Pipeline 87: Platform Engineering – Golden Path Templates
+# Complexity: Highly Complex
+# Concepts: Internal developer platform (IDP) golden paths,
+#           scaffolded service templates, Backstage catalog,
+#           template versioning, smoke test of scaffolded apps,
+#           platform policy enforcement, developer onboarding
+# ============================================================
+
+trigger:
+  branches:
+    include: [main]
+  paths:
+    include: [platform/templates/**, platform/policies/**, backstage/**]
+
+parameters:
+  - name: templates
+    type: object
+    default:
+      - name: dotnet-web-api
+        version: v3
+        language: dotnet
+        type: api
+      - name: nodejs-express
+        version: v2
+        language: nodejs
+        type: api
+      - name: python-fastapi
+        version: v2
+        language: python
+        type: api
+      - name: react-spa
+        version: v3
+        language: nodejs
+        type: frontend
+  - name: publishToBackstage
+    type: boolean
+    default: true
+  - name: runSmokeTests
+    type: boolean
+    default: true
+
+variables:
+  - group: platform-engineering-vars
+  - name: templateRegistry
+    value: $(acrName).azurecr.io/platform-templates
+  - name: backstageBaseUrl
+    value: https://backstage.$(orgDomain)
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: ValidateTemplates
+    displayName: Validate Golden Path Templates
+    jobs:
+      - job: LintAndValidate
+        steps:
+          - checkout: self
+
+          - bash: |
+              npm install -g cookiecutter-lint yaml-lint || true
+              pip install copier yamllint jsonschema
+            displayName: Install validation tools
+
+          - bash: |
+              # Validate each template's cookiecutter.json / copier.yml
+              for tmpl_dir in platform/templates/*/; do
+                echo "=== Validating: $tmpl_dir ==="
+                if [ -f "$tmpl_dir/cookiecutter.json" ]; then
+                  python -c "import json; json.load(open('$tmpl_dir/cookiecutter.json'))" && echo "cookiecutter.json OK"
+                fi
+                if [ -f "$tmpl_dir/copier.yml" ]; then
+                  yamllint "$tmpl_dir/copier.yml" && echo "copier.yml OK"
+                fi
+                # Check required template files exist
+                for required in README.md .azure-pipelines/; do
+                  [ -e "$tmpl_dir$required" ] || echo "##vso[task.logissue type=warning]Missing: $tmpl_dir$required"
+                done
+              done
+            displayName: Validate template structure
+
+          - bash: |
+              # Validate platform policies (OPA/Rego)
+              if command -v opa &>/dev/null; then
+                for policy in platform/policies/*.rego; do
+                  echo "Checking: $policy"
+                  opa check "$policy"
+                done
+              fi
+            displayName: Validate OPA policies
+
+          - bash: |
+              # Validate Backstage catalog definitions
+              for catalog in backstage/catalog/*.yaml; do
+                echo "Validating catalog: $catalog"
+                python - <<'PYEOF'
+import yaml, sys
+with open("$catalog") as f:
+    doc = yaml.safe_load(f)
+required = ["apiVersion", "kind", "metadata", "spec"]
+for field in required:
+    if field not in doc:
+        print(f"Missing required field: {field}", file=sys.stderr)
+        sys.exit(1)
+print("Valid catalog entity")
+PYEOF
+              done
+            displayName: Validate Backstage catalog
+
+  - stage: SmokeTestTemplates
+    displayName: Smoke Test – Scaffold & Build Each Template
+    dependsOn: ValidateTemplates
+    condition: and(succeeded(), eq('${{ parameters.runSmokeTests }}', 'true'))
+    jobs:
+      - ${{ each tmpl in parameters.templates }}:
+        - job: Smoke_${{ replace(tmpl.name, '-', '_') }}
+          displayName: Smoke Test ${{ tmpl.name }}
+          timeoutInMinutes: 20
+          steps:
+            - checkout: self
+
+            - bash: |
+                pip install copier
+              displayName: Install copier
+
+            - bash: |
+                # Scaffold a test project from the template
+                copier copy \
+                  platform/templates/${{ tmpl.name }} \
+                  /tmp/smoke-${{ tmpl.name }} \
+                  --data "project_name=smoke-test" \
+                  --data "repo_name=smoke-test-${{ tmpl.name }}" \
+                  --data "team_name=platform" \
+                  --data "environment=dev" \
+                  --defaults
+              displayName: Scaffold from ${{ tmpl.name }} template
+
+            # Build the scaffolded app to verify it compiles
+            - ${{ if eq(tmpl.language, 'dotnet') }}:
+              - bash: |
+                  cd /tmp/smoke-${{ tmpl.name }}
+                  dotnet build --no-restore 2>&1
+                displayName: Build .NET scaffolded project
+
+            - ${{ if eq(tmpl.language, 'nodejs') }}:
+              - bash: |
+                  cd /tmp/smoke-${{ tmpl.name }}
+                  npm ci && npm run build 2>&1
+                displayName: Build Node.js scaffolded project
+
+            - ${{ if eq(tmpl.language, 'python') }}:
+              - bash: |
+                  cd /tmp/smoke-${{ tmpl.name }}
+                  pip install -r requirements.txt && python -m py_compile main.py 2>&1
+                displayName: Build Python scaffolded project
+
+            - bash: |
+                # Ensure generated pipeline YAML is valid
+                pip install yamllint
+                find /tmp/smoke-${{ tmpl.name }}/.azure-pipelines -name "*.yml" -exec yamllint {} \;
+              displayName: Validate generated pipeline YAML
+
+  - stage: PackageAndVersion
+    displayName: Package Templates with Version Tags
+    dependsOn: SmokeTestTemplates
+    jobs:
+      - job: PackageTemplates
+        steps:
+          - checkout: self
+
+          - bash: |
+              mkdir -p dist/templates
+
+              # Package each template as OCI artifact
+              for tmpl_dir in platform/templates/*/; do
+                TMPL_NAME=$(basename "$tmpl_dir")
+                TMPL_VERSION=$(cat "$tmpl_dir/version.txt" 2>/dev/null || echo "$(Build.BuildId)")
+
+                # Create tarball
+                tar -czf "dist/templates/$TMPL_NAME-$TMPL_VERSION.tar.gz" -C platform/templates "$TMPL_NAME"
+                echo "Packaged: $TMPL_NAME@$TMPL_VERSION"
+              done
+
+              ls -lh dist/templates/
+            displayName: Package templates
+
+          # Push packaged templates as OCI artifacts to ACR
+          - task: AzureCLI@2
+            displayName: Push template packages to ACR
+            inputs:
+              azureSubscription: sc-azure-platform
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az acr login --name $(acrName)
+                for tarball in dist/templates/*.tar.gz; do
+                  FILENAME=$(basename "$tarball" .tar.gz)
+                  # Push as OCI artifact
+                  oras push $(acrName).azurecr.io/platform/templates/$FILENAME:latest \
+                    "$tarball:application/vnd.platform.template.v1+gzip" \
+                    --export-manifest manifest.json || true
+                done
+
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: dist/templates
+              artifactName: platform-templates
+
+  - stage: PublishBackstage
+    displayName: Register in Backstage Catalog
+    dependsOn: PackageAndVersion
+    condition: and(succeeded(), eq('${{ parameters.publishToBackstage }}', 'true'))
+    jobs:
+      - job: BackstageCatalog
+        steps:
+          - checkout: self
+
+          - bash: |
+              # Update catalog-info.yaml with latest version metadata
+              for catalog_file in backstage/catalog/*.yaml; do
+                ENTITY_NAME=$(yq '.metadata.name' "$catalog_file")
+                echo "Updating catalog: $ENTITY_NAME"
+
+                # Generate new catalog entity content with build metadata
+                yq eval "
+                  .metadata.annotations[\"platform.io/build-id\"] = \"$(Build.BuildId)\" |
+                  .metadata.annotations[\"platform.io/deploy-date\"] = \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"
+                " "$catalog_file" > "$catalog_file.tmp"
+                mv "$catalog_file.tmp" "$catalog_file"
+              done
+            displayName: Update catalog metadata
+
+          # Commit updated catalog back to repo
+          - bash: |
+              git config user.email "platform-bot@$(orgDomain)"
+              git config user.name "Platform Bot"
+              git add backstage/catalog/
+              if ! git diff --cached --quiet; then
+                git commit -m "chore(platform): update catalog metadata [build $(Build.BuildId)] [skip ci]"
+                git push origin HEAD:$(Build.SourceBranchName)
+              fi
+            displayName: Commit catalog updates
+
+          # Trigger Backstage catalog refresh
+          - bash: |
+              curl -sf -X POST \
+                -H "Authorization: Bearer $(backstageToken)" \
+                -H "Content-Type: application/json" \
+                "$(backstageBaseUrl)/api/catalog/refresh" \
+                -d '{"entityRef": "location:default/platform-templates"}' || true
+              echo "Backstage catalog refresh triggered"
+            displayName: Refresh Backstage catalog

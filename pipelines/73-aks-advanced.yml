@@ -1,0 +1,180 @@
+# ============================================================
+# Pipeline 73: AKS Advanced – HPA, PDB, Network Policy Deploy
+# Complexity: Highly Complex
+# Concepts: HPA (HorizontalPodAutoscaler), PodDisruptionBudget,
+#           NetworkPolicy, KEDA, resource quotas, Istio injection,
+#           kubectl apply manifest sets
+# ============================================================
+
+trigger:
+  branches:
+    include: [main]
+  paths:
+    include: [k8s/**, src/**]
+
+variables:
+  containerRegistry: myacr.azurecr.io
+  imageRepository: myapp/api
+  imageTag: $(Build.BuildId)
+  k8sNamespace: myapp-prod
+  aksServiceConnection: sc-aks-prod
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: Build
+    jobs:
+      - job: BuildImage
+        steps:
+          - checkout: self
+          - task: Docker@2
+            inputs:
+              command: buildAndPush
+              repository: $(containerRegistry)/$(imageRepository)
+              containerRegistry: sc-acr
+              tags: $(imageTag)
+
+  - stage: ValidateManifests
+    displayName: Validate K8s Manifests
+    dependsOn: Build
+    jobs:
+      - job: KubeScore
+        steps:
+          - checkout: self
+          - bash: |
+              curl -L https://github.com/zegl/kube-score/releases/download/v1.18.0/kube-score_1.18.0_linux_amd64.tar.gz | tar xz
+              sudo mv kube-score /usr/local/bin/
+              find k8s/ -name "*.yml" | xargs kube-score score || true
+            displayName: kube-score validate
+
+      - job: KubeLint
+        steps:
+          - checkout: self
+          - bash: |
+              docker run --rm \
+                -v $(pwd)/k8s:/data \
+                stackrox/kube-linter:latest lint /data/ || true
+            displayName: KubeLinter
+
+  - stage: Deploy
+    displayName: Deploy Advanced K8s Resources
+    dependsOn: ValidateManifests
+    jobs:
+      - deployment: AdvancedDeploy
+        environment: production/myapp-prod
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                # Apply namespace with labels (Istio injection)
+                - task: Kubernetes@1
+                  displayName: Configure namespace
+                  inputs:
+                    kubernetesServiceEndpoint: $(aksServiceConnection)
+                    command: apply
+                    arguments: -f -
+                  env:
+                    NAMESPACE_YAML: |
+                      apiVersion: v1
+                      kind: Namespace
+                      metadata:
+                        name: $(k8sNamespace)
+                        labels:
+                          istio-injection: enabled
+                          environment: production
+
+                # Apply Resource Quota
+                - task: KubernetesManifest@1
+                  displayName: Apply ResourceQuota
+                  inputs:
+                    action: deploy
+                    kubernetesServiceConnection: $(aksServiceConnection)
+                    namespace: $(k8sNamespace)
+                    manifests: k8s/quota.yml
+
+                # Deploy main application
+                - task: KubernetesManifest@1
+                  displayName: Deploy application
+                  inputs:
+                    action: deploy
+                    kubernetesServiceConnection: $(aksServiceConnection)
+                    namespace: $(k8sNamespace)
+                    manifests: |
+                      k8s/deployment.yml
+                      k8s/service.yml
+                    containers: $(containerRegistry)/$(imageRepository):$(imageTag)
+
+                # Apply HorizontalPodAutoscaler
+                - task: Kubernetes@1
+                  displayName: Apply HPA
+                  inputs:
+                    kubernetesServiceEndpoint: $(aksServiceConnection)
+                    namespace: $(k8sNamespace)
+                    command: apply
+                    arguments: -f k8s/hpa.yml
+
+                # Apply PodDisruptionBudget
+                - task: Kubernetes@1
+                  displayName: Apply PDB
+                  inputs:
+                    kubernetesServiceEndpoint: $(aksServiceConnection)
+                    namespace: $(k8sNamespace)
+                    command: apply
+                    arguments: -f k8s/pdb.yml
+
+                # Apply NetworkPolicy
+                - task: Kubernetes@1
+                  displayName: Apply NetworkPolicy
+                  inputs:
+                    kubernetesServiceEndpoint: $(aksServiceConnection)
+                    namespace: $(k8sNamespace)
+                    command: apply
+                    arguments: -f k8s/network-policy.yml
+
+                # Apply KEDA ScaledObject (event-driven autoscaling)
+                - task: Kubernetes@1
+                  displayName: Apply KEDA ScaledObject
+                  inputs:
+                    kubernetesServiceEndpoint: $(aksServiceConnection)
+                    namespace: $(k8sNamespace)
+                    command: apply
+                    arguments: -f k8s/keda-scaledobject.yml
+                  continueOnError: true    # OK if KEDA not installed
+
+                # Wait and verify
+                - task: Kubernetes@1
+                  displayName: Wait for rollout
+                  inputs:
+                    kubernetesServiceEndpoint: $(aksServiceConnection)
+                    namespace: $(k8sNamespace)
+                    command: rollout
+                    arguments: status deployment/myapp-api --timeout=5m
+
+                - task: Kubernetes@1
+                  displayName: Show HPA status
+                  inputs:
+                    kubernetesServiceEndpoint: $(aksServiceConnection)
+                    namespace: $(k8sNamespace)
+                    command: get
+                    arguments: hpa
+
+                - task: Kubernetes@1
+                  displayName: Show PDB status
+                  inputs:
+                    kubernetesServiceEndpoint: $(aksServiceConnection)
+                    namespace: $(k8sNamespace)
+                    command: get
+                    arguments: pdb
+
+                # Describe pod resource requests/limits
+                - task: Kubernetes@1
+                  displayName: Describe pod resources
+                  inputs:
+                    kubernetesServiceEndpoint: $(aksServiceConnection)
+                    namespace: $(k8sNamespace)
+                    command: get
+                    arguments: pods -o custom-columns="NAME:.metadata.name,CPU-REQ:.spec.containers[*].resources.requests.cpu,MEM-REQ:.spec.containers[*].resources.requests.memory,CPU-LIM:.spec.containers[*].resources.limits.cpu,MEM-LIM:.spec.containers[*].resources.limits.memory"

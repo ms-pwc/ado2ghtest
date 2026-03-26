@@ -1,0 +1,136 @@
+# ============================================================
+# Pipeline 40: Teams & Slack Notifications
+# Complexity: Medium
+# Concepts: InvokeRestAPI, AzureCLI webhook POST, notification
+#           on success/failure, pull request comments,
+#           structured adaptive card payloads
+# ============================================================
+
+trigger:
+  branches:
+    include: [main]
+
+variables:
+  # Webhook URLs stored as secret pipeline variables / variable group
+  teamsWebhookUrl: $(TEAMS_WEBHOOK_URL)
+  slackWebhookUrl: $(SLACK_WEBHOOK_URL)
+  appName: MyApplication
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: Build
+    jobs:
+      - job: BuildApp
+        steps:
+          - checkout: self
+          - script: echo "Building $(appName)..."
+            displayName: Build
+
+  - stage: Notify
+    displayName: Send Notifications
+    dependsOn: Build
+    condition: always()       # notify regardless of build result
+    jobs:
+      - job: NotifyTeams
+        displayName: Notify Microsoft Teams
+        steps:
+          # Send Adaptive Card to Teams on success
+          - bash: |
+              STATUS_COLOR="#28a745"
+              STATUS_TEXT="Succeeded"
+              if [ "$(Build.Reason)" != "Schedule" ]; then
+                STATUS_COLOR="#dc3545"
+              fi
+
+              RESULT="$(stageDependencies.Build.BuildApp.result)"
+              [ "$RESULT" = "Succeeded" ] && STATUS_COLOR="#28a745" || STATUS_COLOR="#dc3545"
+              [ "$RESULT" = "Succeeded" ] && STATUS_TEXT="✅ Succeeded" || STATUS_TEXT="❌ Failed"
+
+              PAYLOAD=$(cat <<EOF
+              {
+                "type": "message",
+                "attachments": [{
+                  "contentType": "application/vnd.microsoft.card.adaptive",
+                  "content": {
+                    "type": "AdaptiveCard",
+                    "version": "1.3",
+                    "body": [
+                      {
+                        "type": "TextBlock",
+                        "text": "Pipeline: $(Build.DefinitionName)",
+                        "weight": "Bolder",
+                        "size": "Medium"
+                      },
+                      {
+                        "type": "FactSet",
+                        "facts": [
+                          {"title": "Status",  "value": "$STATUS_TEXT"},
+                          {"title": "Branch",  "value": "$(Build.SourceBranchName)"},
+                          {"title": "Build",   "value": "$(Build.BuildNumber)"},
+                          {"title": "Trigger", "value": "$(Build.Reason)"},
+                          {"title": "By",      "value": "$(Build.RequestedFor)"}
+                        ]
+                      }
+                    ],
+                    "actions": [{
+                      "type": "Action.OpenUrl",
+                      "title": "View Build",
+                      "url": "$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)"
+                    }]
+                  }
+                }]
+              }
+              EOF
+              )
+
+              curl -s -X POST \
+                -H 'Content-Type: application/json' \
+                -d "$PAYLOAD" \
+                "$(teamsWebhookUrl)" \
+                && echo "Teams notification sent" \
+                || echo "Teams notification failed (non-blocking)"
+            displayName: Send Teams adaptive card
+            condition: always()
+            env:
+              TEAMS_WEBHOOK_URL: $(teamsWebhookUrl)
+
+      - job: NotifySlack
+        displayName: Notify Slack
+        steps:
+          - bash: |
+              RESULT="$(stageDependencies.Build.BuildApp.result)"
+              [ "$RESULT" = "Succeeded" ] && EMOJI=":white_check_mark:" || EMOJI=":x:"
+              [ "$RESULT" = "Succeeded" ] && COLOR="good" || COLOR="danger"
+
+              PAYLOAD=$(cat <<EOF
+              {
+                "attachments": [{
+                  "color": "$COLOR",
+                  "title": "$(Build.DefinitionName) – $RESULT",
+                  "title_link": "$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)",
+                  "fields": [
+                    {"title": "Branch", "value": "$(Build.SourceBranchName)", "short": true},
+                    {"title": "Build",  "value": "$(Build.BuildNumber)",      "short": true},
+                    {"title": "By",     "value": "$(Build.RequestedFor)",     "short": true},
+                    {"title": "Status", "value": "$EMOJI $RESULT",            "short": true}
+                  ],
+                  "footer": "Azure DevOps",
+                  "ts": $(date +%s)
+                }]
+              }
+              EOF
+              )
+
+              curl -s -X POST \
+                -H 'Content-Type: application/json' \
+                -d "$PAYLOAD" \
+                "$(slackWebhookUrl)" \
+                && echo "Slack notification sent" \
+                || echo "Slack notification failed (non-blocking)"
+            displayName: Send Slack notification
+            condition: always()
+            env:
+              SLACK_WEBHOOK_URL: $(slackWebhookUrl)

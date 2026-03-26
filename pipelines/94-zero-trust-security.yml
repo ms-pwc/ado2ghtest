@@ -1,0 +1,297 @@
+# ============================================================
+# Pipeline 94: Zero-Trust Security Hardening Pipeline
+# Complexity: Highly Complex
+# Concepts: Microsoft Entra Conditional Access, Workload Identity
+#           Federation (OIDC), secret rotation, managed identity
+#           assignment, RBAC principle of least privilege audit,
+#           network segmentation validation, JIT access review,
+#           certificate lifecycle management
+# ============================================================
+
+trigger:
+  branches:
+    include: [main]
+  paths:
+    include: [security/**, infra/identity/**]
+
+schedules:
+  - cron: '0 1 * * *'
+    displayName: Daily security posture check
+    branches:
+      include: [main]
+    always: true
+
+parameters:
+  - name: environment
+    type: string
+    default: prod
+    values: [staging, prod]
+  - name: rotateCerts
+    type: boolean
+    default: false
+  - name: rotateSecrets
+    type: boolean
+    default: false
+  - name: enforcePolicy
+    type: boolean
+    default: false
+
+variables:
+  - group: zerotrust-${{ parameters.environment }}-vars
+  - name: keyVaultName
+    value: kv-$(orgName)-${{ parameters.environment }}
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+  - stage: IdentityAudit
+    displayName: Identity & Access Audit
+    jobs:
+      - job: EntraIDAudit
+        steps:
+          - task: AzureCLI@2
+            displayName: Audit service principals
+            inputs:
+              azureSubscription: sc-azure-${{ parameters.environment }}
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                echo "=== Service Principals with expiring credentials ==="
+                # Find SPs with credentials expiring in next 30 days
+                EXPIRY_DATE=$(date -d '+30 days' +%Y-%m-%dT00:00:00Z)
+
+                az ad app list --all \
+                  --query "[].{app:appId,name:displayName,creds:passwordCredentials[?endDateTime<='$EXPIRY_DATE']}" \
+                  -o json | python3 -c "
+                import json, sys
+                apps = json.load(sys.stdin)
+                expiring = [a for a in apps if a.get('creds')]
+                if expiring:
+                    print(f'WARNING: {len(expiring)} app(s) have expiring credentials:')
+                    for a in expiring:
+                        print(f'  - {a[\"name\"]} ({a[\"app\"]})')
+                else:
+                    print('No expiring credentials found')
+                "
+
+          - task: AzureCLI@2
+            displayName: Audit over-privileged roles
+            inputs:
+              azureSubscription: sc-azure-${{ parameters.environment }}
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                echo "=== Owner role assignments ==="
+                az role assignment list \
+                  --role Owner \
+                  --include-inherited \
+                  --query "[].{principal:principalName,type:principalType,scope:scope}" \
+                  -o table
+
+                echo ""
+                echo "=== Contributor at subscription scope ==="
+                az role assignment list \
+                  --role Contributor \
+                  --scope "/subscriptions/$(subscriptionId)" \
+                  --query "[].{principal:principalName,type:principalType}" \
+                  -o table
+
+          - task: AzureCLI@2
+            displayName: Check workload identity federation
+            inputs:
+              azureSubscription: sc-azure-${{ parameters.environment }}
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                # Check if ADO service connections use workload identity federation
+                az ad app list --display-name "*ado*" \
+                  --query "[].{app:appId,name:displayName}" -o table || true
+
+                # List federated credentials
+                for app_id in $(az ad app list --display-name "*deploy*" --query "[].appId" -o tsv); do
+                  echo "=== Federated creds for $app_id ==="
+                  az ad app federated-credential list --id "$app_id" -o table 2>/dev/null || echo "None"
+                done
+
+  - stage: NetworkSecurity
+    displayName: Network Security Validation
+    jobs:
+      - job: NetworkAudit
+        steps:
+          - task: AzureCLI@2
+            displayName: Scan NSG rules for broad allow
+            inputs:
+              azureSubscription: sc-azure-${{ parameters.environment }}
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                echo "=== NSG rules allowing 0.0.0.0/0 (any source) ==="
+                az network nsg list \
+                  --query "[].{nsg:name,rg:resourceGroup,broadRules:securityRules[?sourceAddressPrefix=='*'||sourceAddressPrefix=='0.0.0.0/0'].{name:name,direction:direction,port:destinationPortRange}}" \
+                  -o json | python3 -c "
+                import json, sys
+                nsgs = json.load(sys.stdin)
+                for nsg in nsgs:
+                    rules = nsg.get('broadRules', [])
+                    if rules:
+                        print(f'WARNING NSG {nsg[\"nsg\"]}: {len(rules)} broad rules found')
+                        for r in rules:
+                            print(f'  - {r[\"name\"]} {r[\"direction\"]} port={r[\"port\"]}')
+                "
+
+          - task: AzureCLI@2
+            displayName: Validate private endpoints configured
+            inputs:
+              azureSubscription: sc-azure-${{ parameters.environment }}
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                # List Key Vaults without private endpoint
+                az keyvault list \
+                  --query "[?properties.publicNetworkAccess!='Disabled'].{name:name,publicAccess:properties.publicNetworkAccess}" \
+                  -o table
+
+                # List Storage Accounts with public access
+                az storage account list \
+                  --query "[?allowBlobPublicAccess==\`true\`].{name:name,rg:resourceGroup}" \
+                  -o table
+
+  - stage: SecretAndCertManagement
+    displayName: Secret & Certificate Lifecycle
+    jobs:
+      - job: AuditExpiry
+        steps:
+          - task: AzureCLI@2
+            displayName: Audit Key Vault secrets expiry
+            inputs:
+              azureSubscription: sc-azure-${{ parameters.environment }}
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                WARN_DAYS=30
+                NOW=$(date +%s)
+
+                echo "=== Secrets expiring within $WARN_DAYS days ==="
+                az keyvault secret list \
+                  --vault-name $(keyVaultName) \
+                  --query "[?attributes.expires!=null]" \
+                  -o json | python3 -c "
+                import json, sys, time
+                from datetime import datetime, timezone
+
+                secrets = json.load(sys.stdin)
+                now = time.time()
+                warn_seconds = 30 * 86400
+
+                for s in secrets:
+                    exp = s['attributes']['expires']
+                    if exp:
+                        exp_dt = datetime.fromisoformat(exp.replace('Z','+00:00'))
+                        diff = exp_dt.timestamp() - now
+                        if diff < warn_seconds:
+                            days = int(diff / 86400)
+                            name = s['name']
+                            print(f'WARN: Secret \"{name}\" expires in {days} days')
+                "
+
+          - task: AzureCLI@2
+            displayName: Audit certificates expiry
+            inputs:
+              azureSubscription: sc-azure-${{ parameters.environment }}
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az keyvault certificate list \
+                  --vault-name $(keyVaultName) -o json | python3 -c "
+                import json, sys, time
+                from datetime import datetime, timezone
+
+                certs = json.load(sys.stdin)
+                now = time.time()
+                warn_seconds = 30 * 86400
+
+                for c in certs:
+                    exp = c['attributes']['expires']
+                    if exp:
+                        exp_dt = datetime.fromisoformat(exp.replace('Z','+00:00'))
+                        diff = exp_dt.timestamp() - now
+                        if diff < warn_seconds:
+                            days = int(diff / 86400)
+                            name = c['name']
+                            print(f'WARN: Cert \"{name}\" expires in {days} days')
+                        else:
+                            name = c['name']
+                            days = int(diff / 86400)
+                            print(f'OK: {name} expires in {days} days')
+                "
+
+      - job: RotateSecrets
+        condition: and(succeeded(), eq('${{ parameters.rotateSecrets }}', 'true'))
+        steps:
+          - task: AzureCLI@2
+            displayName: Rotate expiring secrets
+            inputs:
+              azureSubscription: sc-azure-${{ parameters.environment }}
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                # Load rotation manifest
+                if [ -f security/secret-rotation.json ]; then
+                  cat security/secret-rotation.json | python3 -c "
+                import json, sys, subprocess, secrets, string
+                manifest = json.load(sys.stdin)
+                for entry in manifest.get('auto_rotate', []):
+                    name = entry['name']
+                    length = entry.get('length', 32)
+                    charset = entry.get('charset', 'alphanumeric')
+                    # Generate new secret
+                    chars = string.ascii_letters + string.digits
+                    new_value = ''.join(secrets.choice(chars) for _ in range(length))
+                    print(f'Rotating: {name}')
+                    subprocess.run(['az', 'keyvault', 'secret', 'set',
+                                    '--vault-name', '$(keyVaultName)',
+                                    '--name', name,
+                                    '--value', new_value], check=True)
+                  "
+                fi
+
+  - stage: PolicyCompliance
+    displayName: Azure Policy Compliance Check
+    jobs:
+      - job: PolicyAssessment
+        steps:
+          - task: AzureCLI@2
+            displayName: Check non-compliant resources
+            inputs:
+              azureSubscription: sc-azure-${{ parameters.environment }}
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                NON_COMPLIANT=$(az policy state list \
+                  --query "[?complianceState=='NonCompliant']" \
+                  -o json | python3 -c "
+                import json, sys
+                states = json.load(sys.stdin)
+                high = [s for s in states if s.get('policyDefinitionCategory','').lower() in ['security','identity']]
+                print(f'Total non-compliant: {len(states)}, High-priority: {len(high)}')
+                for s in high[:10]:
+                    print(f'  - {s.get(\"resourceId\",\"N/A\").split(\"/\")[-1]} | {s.get(\"policyDefinitionName\",\"?\")}')
+                ")
+                echo "$NON_COMPLIANT"
+
+          - task: AzureCLI@2
+            displayName: Show security score
+            inputs:
+              azureSubscription: sc-azure-${{ parameters.environment }}
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az security secure-score list \
+                  --query "[].{score:score.percentage,max:score.max}" \
+                  -o table || true
+
+                az security assessment list \
+                  --query "[?status.code=='Unhealthy'].{displayName:displayName,severity:metadata.severity}" \
+                  -o table | head -20
